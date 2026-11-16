@@ -1,0 +1,512 @@
+# PRF-keyed Encryption VFS
+
+At-rest encryption for SqliteWasmBlazor databases stored in OPFS. Every
+SQLite page is encrypted with ChaCha20-Poly1305 using a 32-byte key
+supplied by the caller (typically PRF-derived via BlazorPRF's
+`DeriveDomainKeyAsync`). Non-encrypted consumers are unaffected — the
+same VFS falls through to byte-for-byte vendor SAHPool behavior when
+no key is registered.
+
+## Why
+
+OPFS stores files in a browser-origin directory on disk in plaintext.
+Full-disk encryption covers the stolen-laptop case; it does not cover
+cloud backups that capture the browser profile, forensic recovery of
+deleted fragments, or a running/unlocked machine. Encrypting at the VFS
+layer closes those gaps — the OPFS file is opaque ciphertext whenever
+the device is not actively holding the key.
+
+## Threat model
+
+| Attacker capability                           | Defended |
+|-----------------------------------------------|----------|
+| Read OPFS files offline (stolen disk, backup) | Yes      |
+| Modify OPFS files (byte flips in ciphertext)  | Yes — AEAD auth fails loudly |
+| Swap pages within a DB                        | Yes — AAD binds `slotIndex` |
+| Swap pages between two DBs under same key     | Yes — AAD binds `dbPath`    |
+| Roll back entire OPFS to earlier snapshot     | **No** — see "known limitations" |
+| Same-origin in-page script (XSS, dep compromise) | **No** — see "known limitations" |
+| Live-process memory dump                      | Partial — see "known limitations" |
+
+The design target is *local file confidentiality*: a device at rest, or whose
+user is not actively unlocking the database, reveals nothing useful from its
+OPFS directory. Actors, scope boundaries and the reasoning behind each **No**
+above live in [`security/threat-model.md`](security/threat-model.md); this
+document covers how the mechanisms in the right-hand column work.
+
+## Primitives and standards
+
+| Role                          | Primitive                        | Standard / reference |
+|-------------------------------|----------------------------------|---------------------|
+| Page AEAD                     | ChaCha20-Poly1305                | RFC 8439            |
+| Nonce source                  | `crypto.getRandomValues` (CSPRNG)| Web Crypto          |
+| Key length                    | 256 bits (32 bytes)              | —                   |
+| Nonce length                  | 96 bits (12 bytes)               | per RFC 8439        |
+| AEAD tag                      | 128 bits (16 bytes)              | per RFC 8439        |
+
+All crypto flows through `@sqlitewasmblazor/crypto-core`, which wraps
+`@awasm/noble` (WASM-SIMD implementations by Paul Miller) on the
+symmetric + hash + KDF side. Asymmetric primitives (X25519, Ed25519)
+route through SubtleCrypto. The
+"single crypto provider" rule means there is exactly one implementation
+of each primitive in the bundle, and cross-implementation drift is
+caught by BouncyCastle-backed xUnit tests that exercise the same test
+vectors.
+
+## Architectural approach
+
+The vendor `opfs-sahpool` VFS shipped in `@sqlite.org/sqlite-wasm` keeps
+its per-file state in ES private fields and exposes no subclassing or
+delegation hook. Rather than patch the upstream package, we forked the
+VFS into our own TypeScript module at
+`SqliteWasmBlazor/TypeScript/worker/vfs-prf/sahpool-prf-vfs.ts`,
+registered it under the same name (`opfs-sahpool`) and the same
+directory (`/databases/`), and added conditional encryption in `xRead`,
+`xWrite`, `xOpen`, and `xClose`. A single VFS serves both modes:
+
+- **Key registered for path** → offset-remapping ChaCha20-Poly1305: each
+  4096-byte logical page that SQLite writes expands to a 4124-byte
+  physical slot on disk (ciphertext 4096 + nonce 12 + tag 16). The VFS
+  translates every logical offset SQLite passes into a physical offset
+  on the SAH, so the same scheme covers main DB, WAL frames, rollback
+  journals, and temp files uniformly.
+- **No key registered** → straight pass-through to the `SyncAccessHandle`,
+  byte-for-byte identical to vendor.
+
+## Page envelope
+
+SQLite sees 4096-byte pages with `reserved_bytes=0` — it uses the full
+page for content and is never told about the crypto envelope. The VFS
+expands each 4096-byte logical block into a 4124-byte physical slot on
+disk:
+
+```
+Logical view (what SQLite reads/writes):   [ 4096 ][ 4096 ][ 4096 ] …
+
+Physical on disk (after SAHPool header):
+┌─────────────────────────────────────┬──────────┬──────────┐
+│       ciphertext  (4096 bytes)      │ nonce 12 │  tag 16  │
+└─────────────────────────────────────┴──────────┴──────────┘
+         ^ one 4124-byte physical slot per logical 4096-byte page
+         ^ AEAD plaintext = the full 4096-byte page view
+         ^ Page 1: SQLite-format-3 magic lives at plaintext offset 0 — ciphertext on disk
+```
+
+Offset translation (logical → physical, relative to `HEADER_OFFSET_DATA`):
+
+```
+slotIndex   = logicalOffset >> 12                 (∕ 4096)
+physical    = slotIndex * 4124 + (logicalOffset mod 4096)
+```
+
+`xFileSize` divides the SAH size by 4124 and multiplies by 4096 to
+report the logical size SQLite expects; `xTruncate` does the reverse.
+The SAHPool per-file 4096-byte header region at file offset 0 is outside
+the encrypted region and still holds the vendor's path/flags/digest
+metadata.
+
+Because the envelope applies uniformly to any byte offset the VFS sees,
+WAL frames (`[24B frame header][4096B page]` at unaligned offsets) and
+rollback journals are encrypted by exactly the same slot scheme without
+needing any SQLite-level awareness. This is what enables
+`journal_mode=WAL` on encrypted DBs.
+
+Plaintext DBs (no key registered) use the same SAH layout as vendor: no
+remapping, no nonce/tag tail, full 4096-byte pages at their natural
+offsets, and the SQLite-format-3 magic at offset 0 of the file.
+
+## AAD binding
+
+Every AEAD call uses an Associated Authenticated Data parameter that
+binds the ciphertext to its context:
+
+```
+AAD = "prf-vfs-v1|" + dbPath + "|" + slotIndex(LE u32)
+```
+
+- **version prefix** (`prf-vfs-v1|`) — lets us evolve the envelope
+  without cross-version confusion.
+- **dbPath** — prevents ciphertext swap between two DBs under the same
+  key. Page 5 of DB `a.db` cannot be pasted into DB `b.db` at slot 5.
+- **slotIndex** — prevents page reordering within the same DB.
+
+File-type (MAIN_DB vs WAL vs JOURNAL) is deliberately *not* in the AAD.
+SQLite's crash-recovery writes journal bytes back into the main DB at
+the same offsets; binding the file-type would break replay.
+
+## Nonce strategy
+
+Random 96-bit nonce per write via `crypto.getRandomValues`, persisted
+next to the ciphertext in the slot's 28-byte physical tail. Over 2^32 writes
+under a single key the collision probability is ~2^-32 ≈ 10^-10 (one in
+ten billion); over a year of aggressive PWA usage (~2^30 writes) it is
+effectively zero.
+
+Deterministic nonces derived from (key, offset) were considered and
+**ruled out**: SQLite overwrites the same offset with different content
+on every commit, which would produce a (key, nonce) reuse — a
+catastrophic failure mode for ChaCha20-Poly1305 that leaks the Poly1305
+auth key. Random per-write nonce is the only safe scheme at the VFS
+layer.
+
+## Key lifecycle (direct key path)
+
+```
+Caller supplies 32-byte pool key (PRF-derived, or otherwise)
+   │
+   ▼
+IEncryptedSqliteWasmDatabaseService.UnlockAsync(key)
+   │   → bridge.SetEncryptionKeyAsync(key)
+   ▼
+SqliteWasmWorkerBridge (C#)
+   │   VfsKeyHeader { Version=1, Key=bytes, AadVersion="v1" }
+   │   MessagePack serialize → SendBinaryToWorker(bytes, metadataJson)
+   │   finally: ZeroMemory(serializedBytes); header.Clear()
+   ▼
+[postMessage → binaryPayload]
+   │
+   ▼
+Worker 'setGlobalEncryptionKey' handler
+   │   unpackVfsKeyHeader(bytes) → validates version + aad version
+   │   close every open DB for page-cache coherence
+   │   setGlobalKey(key) ← one worker-wide key for the whole pool
+   ▼
+SqliteWasmConnection.OpenAsync
+   │   → bridge.OpenDatabaseAsync(db) (no key envelope)
+   │
+   ▼
+Every xRead/xWrite: read globalKey dynamically; if set, use
+ChaCha20-Poly1305 per slot with AAD
+   │
+   │  (Lock / Leave / Reset)
+   ▼
+clearGlobalKey() → clearBytes(key); globalKey = undefined
+```
+
+Zeroization touchpoints:
+- C# `VfsKeyHeader.Clear()` zeros the object's internal byte[].
+- C# `CryptographicOperations.ZeroMemory(serializedBytes)` zeros the
+  MessagePack-serialized buffer after the `postMessage` returns.
+- Worker `unpackVfsKeyHeader` copies the key out, then zeros the transferred
+  MessagePack payload and decoded key view.
+- Worker `clearGlobalKey()` zeros the worker-wide global key at lock /
+  leave / reset.
+- Worker `plaintextScratch.fill(0)` zeros the per-op plaintext scratch
+  after every `encryptedRead` / `encryptedWrite`.
+
+## Key lifecycle (PRF / DomainKeys path)
+
+The recommended flow for app-supplied keys: derive one 32-byte VFS pool key
+from a WebAuthn PRF credential via `PrfService.DeriveDomainKeyAsync("vfs",
+"sqlite-vfs:globalKey:v1")`, install it as the worker global key, then open
+DBs without key envelopes. The passkey hint is written only by
+`IEncryptedSqliteWasmDatabaseService.EnterEncryptedAsync` after all DBs have
+been encrypted in place.
+
+```
+WebAuthn PRF ceremony (one user gesture per session)
+   │  → PrfService.DeriveKeysDiscoverableAsync (or DeriveKeysAsync)
+   │    → SecureKeyCache.Store("prf-seed:{salt}", seed)
+   ▼
+PrfService.DeriveDomainKeyAsync("vfs",
+                                "sqlite-vfs:globalKey:v1")
+   │   → HKDF-SHA256(seed, info=context, len=32)
+   │   → SecureKeyCache.Store("prf-domain:vfs", derived)
+   │   ← PrfResult<string>.Value = cache handle
+   ▼
+SecureKeyCache.TryGet(handle)
+   │   → byte[] copy for async bridge install
+   │   → KeyCacheStrategy.NONE consumes the cached domain key here
+   │
+   │   bridge: VfsKeyHeader { Version=1, Key=keyBytes, AadVersion="v1" }
+   │           MessagePack serialize → postMessage(type='setGlobalEncryptionKey')
+   │           finally: ZeroMemory(envelope); header.Clear()
+   ▼
+Worker 'setGlobalEncryptionKey' handler
+   │   unpackVfsKeyHeader → 32-byte key
+   │   setGlobalKey(key)
+   │   readPoolManifest(verifyMac=true)
+   │   reject unlock if PFAM HMAC does not verify under key
+   ▼
+EF resolves DbContextFactory<TContext>
+   │   → SqliteWasmConnection.OpenAsync (no EncryptionKey set)
+   │   → bridge sends plain 'open' (no binaryPayload)
+   ▼
+Worker 'open' handler
+   │   hasGlobalKey() === true
+   │   → encrypted PRAGMAs, xRead/xWrite use getGlobalKey()
+```
+
+Expiry: subscribe to `IPrfService.KeyExpired`, filter on
+`prf-seed:{salt}`, and call `IEncryptedSqliteWasmDatabaseService.LockAsync`
+to drop the worker global key. `EncryptedPoolLifecycle` wires this for
+Crypto.UI consumers. Re-derivation needs a fresh user gesture — gate the page
+UI behind `PrfService.HasCachedKeys()`.
+
+`KeyCacheStrategy.NONE` is one-shot on the **C# seed cache only**: seed /
+domain-key entries are removed on first `UseKey` / `TryGet`. The JS-side
+key bundle remains session-lifetime under every strategy — the cached
+non-extractable SubtleCrypto handles and X25519 priv buffer are what
+makes signing / ECIES-decrypt / VFS-key-install work *at all*, so a
+zero-TTL JS cache would render the ceremony itself inoperable. NONE is
+therefore practical only for non-CryptoSync, non-encrypted-VFS hosts;
+encrypted-VFS / CryptoSync hosts default to `TIMED` so a single auth
+ceremony can drive multiple cached ops within a session.
+
+A working end-to-end demo lives at `SqliteWasmBlazor.TestApp/Pages/PrfVfsTest.razor`.
+
+## SQLite storage pragmas on encrypted DBs
+
+| PRAGMA              | Value      | Why                                                              |
+|---------------------|------------|------------------------------------------------------------------|
+| `page_size`         | 4096       | Matches the VFS slot size (`SECTOR_SIZE`). Any other size would desync slot boundaries. |
+| `journal_mode`      | `WAL`      | Offset-remap encrypts WAL frames with the same envelope as main DB — full crash recovery. |
+| `locking_mode`      | `exclusive`| Single-writer, consistent with SAHPool's single-tab semantics.   |
+| `synchronous`       | `FULL`     | Durable commits (the usual trade-off).                           |
+
+`reserved_bytes` is **not** configured (stays at 0) — SQLite sees full
+4096-byte pages and the AEAD envelope lives in the 28-byte physical tail
+the VFS adds transparently.
+
+Non-encrypted DBs keep the existing WAL-based configuration.
+
+## Import / export matrix
+
+Three file shapes cross the boundary, and they differ in how much of the
+pool they replace — not just in encoding. The scope is the thing to know
+before picking one:
+
+| File   | Replaces                       | Encryption / passkey                          |
+|--------|--------------------------------|-----------------------------------------------|
+| `.db`  | one database                   | untouched; writes are rekeyed under the pool's key |
+| `.dbs` | every database in the pool      | untouched; each entry rekeyed as it is written |
+| `.eds` | every database **and** the passkey binding | the envelope's own credential replaces the current one |
+
+What each operation needs from `EncryptedPoolState`:
+
+| Operation                | Plain | Encrypted+Unlocked | Encrypted+Locked |
+|--------------------------|-------|--------------------|------------------|
+| Export `.db` / `.dbs`    | ✅ verbatim | ✅ decrypt on read | ❌ `EXPORT_NEEDS_UNLOCK` |
+| Export `.eds`            | ❌ no key   | ✅                 | ❌ `EXPORT_NEEDS_UNLOCK` |
+| Import `.db` / `.dbs`    | ✅ plain pages | ✅ rekey on write | ❌ `PLAIN_IMPORT_NEEDS_UNLOCK` |
+| Import `.eds` (guided)   | ✅ | ⚠️ `GUIDED_IMPORT_NEEDS_LOCK` — lock first | ✅ |
+| Delete one database      | ✅ | ✅ | ❌ |
+| `EnterEncryptedAsync`    | ✅ | ❌ `ENTER_NEEDS_PLAIN` | ❌ `ENTER_NEEDS_PLAIN` |
+| `LeaveEncryptedAsync`    | ❌ `LEAVE_NEEDS_UNLOCK` | ✅ | ❌ `LEAVE_NEEDS_UNLOCK` |
+
+Refusals are `PoolOperationRejectedException`, whose `Reason` names the
+precondition (the codes above) so a UI can say what the pool needs rather
+than print a primitive's diagnostic. Nothing is written when one is
+thrown. The guided `.eds` import is the one case with a mechanical remedy
+— `LockAsync` then retry — and `EncryptionModel.ImportPool` performs it
+itself rather than reporting it.
+
+**Rollback.** Every import validates before it destroys:
+
+- `.eds` — the worker AEAD-verifies *every* slot of *every* file under
+  `K_wrap` in a preflight pass, before the pool is wiped. A crafted or
+  truncated envelope leaves the existing pool intact.
+- `.dbs` — a full read-only pass over the envelope (file count, tuple
+  arity, page alignment, SQLite magic per file, no premature EOF) runs
+  before the wipe.
+- `.db` — written to a temp SAH slot and promoted with
+  `atomicReplaceFile`, so a failure mid-stream leaves the target as it
+  was.
+
+**Validated imports.** Envelope shape says nothing about whether the file
+belongs where it is being put: a TodoDb backup is a perfectly well-formed
+`.db`, and a bundle exported from another app carries perfectly
+well-formed entries. Both single-DB and `.dbs` imports therefore take an
+optional delegate — `validateImported` — that gets to open each imported
+database before it becomes the pool's content:
+
+- what the import would replace is **parked**, renamed to
+  `{name}` + `PoolNaming.ImportParkSuffix`;
+- the incoming file is written under the database's **own name** — page
+  AAD binds ciphertext to the database path (`prf-vfs-v1|{dbPath}|{slot}`),
+  so a file written under a staging name would stop decrypting the moment
+  it was moved;
+- the delegate opens that name with an ordinary connection string and
+  throws if it does not fit;
+- on success the parks are dropped; on refusal the imported files are
+  deleted and the parks renamed back. Renames are metadata-only, so what
+  comes back is byte-identical, page AAD included.
+
+`DbContext.ValidateImportedSchemaAsync` is the check (it throws
+`SchemaMismatchException`, which carries the missing table names so a UI
+can phrase its own message); `IHostDatabaseService.ValidateSchemaAsync` is
+where a host wires it in. Without a delegate an import replaces
+unconditionally, which is what a caller with no model to check against
+still gets. A park outlives an import only if the tab dies mid-flight; the
+next import sweeps whatever it finds, and UI listing pool content hides
+them via `PoolNaming.IsImportPark`.
+
+**Open databases.** `atomicReplaceFile` hands the replaced file's SAH back
+to the pool's free list, and an `OFile` captures its SAH at `xOpen` time.
+Every import therefore closes the databases it is about to replace — in
+the worker (authoritative) and through the bridge (keeps the C# open-set
+mirror in step). Without that close, a surviving handle keeps serving
+pre-import pages and writes into a slot the pool can hand to the next
+file. Regression coverage: `SingleDb_StreamingImport_OverOpenDatabase`,
+`SingleDb_ValidatedImport_RejectedBySchemaCheck`,
+`SingleDb_ValidatedImport_AcceptedOnEncryptedPool` (the AAD half — the
+validator's own read fails if an import is ever written under any name but
+the database's) and `Dbs_ValidatedImport_RejectedBySchemaCheck`.
+
+**After the import.** The bytes that landed decide what the pool holds;
+the schema the app expects is whatever its model says today. Hosts
+implement `IHostDatabaseService.MigrateAsync` to re-run migrations for
+the databases they own, and **the import paths call it themselves** — the
+`.eds` guided import included — so the reconcile happens whether or not
+the app uses the drop-in UI. It also re-creates an owned database an
+import omitted, before the next query opens a schema-less one in its
+place.
+
+## Opaque writes
+
+The public import paths take plain SQLite files only: the worker checks the
+format-3 magic and page alignment before it writes anything, so a truncated or
+crafted source is refused with the pool intact.
+
+The raw slot write underneath them accepts any bytes and auto-detects by
+inspecting the first 16:
+
+- `"SQLite format 3\0"` present → plain SQLite file, normal path with
+  the byte-18 WAL-mode patch.
+- Magic absent → opaque ciphertext of a PRF-VFS-encrypted DB; both the
+  header validation and the byte-18 patch are skipped because they
+  would corrupt the AEAD tag at slot 0.
+
+That path is internal — it is how the VFS tests write tampered ciphertext back
+to prove AEAD catches it, and deliberate garbage to prove SQLite refuses to
+open it. Garbage that lands this way fails on the next open (either
+`SQLITE_NOTADB` if no key is registered, or `SQLITE_IOERR` if one is and AEAD
+auth fails).
+
+## Mode-mismatch behaviour
+
+- Plain DB opened **with** a key → first `xRead` of page 1 fails AEAD
+  auth → `xRead` returns `SQLITE_IOERR` → `SqliteException` at the
+  caller. No plaintext leaks through error paths.
+- Encrypted DB opened **without** a key → VFS takes pass-through; SQLite
+  sees random bytes where the format-3 header should be → `SQLITE_NOTADB`
+  → `SqliteException` at the caller.
+
+Both are exercised by the TestApp's `VFS_ModeMismatch` integration test.
+
+## Test coverage
+
+Three layers:
+
+1. **Integration (envelope)** — `src/Crypto/SqliteWasmBlazor.Crypto/TypeScript/worker/vfs-prf/__tests__/envelope.test.ts`
+   (vitest): page-level AEAD round-trip, wrong key, AAD swap detection,
+   tamper detection, nonce uniqueness, physical slot layout.
+2. **Cross-language primitives** — `src/Base/SqliteWasmBlazor/TypeScript-Crypto/tests/crossLanguage*.test.ts`
+   (vitest) pin the shared vectors that `SqliteWasmBlazor.Crypto.BouncyCastle`
+   has to reproduce, so the offline C# adapter and the in-browser primitives
+   agree byte for byte.
+3. **End-to-end (browser)** — `samples/SqliteWasmBlazor.TestApp`, category
+   "VFS Encryption": full SQL round-trips through real OPFS SAHPool
+   (`VfsEncryptedRoundTripTest`), on-disk-ciphertext verification
+   (`VfsOnDiskCiphertextTest`), plain pass-through regression
+   (`VfsPlainRegressionTest`), wrong key (`VfsWrongKeyFailsTest`), tamper
+   detection (`VfsTamperDetectionTest`), manifest MAC
+   (`VfsManifestMacRejectsWrongKeyTest`), mode mismatch (`VfsModeMismatchTest`),
+   physical-slot layout (`VfsPhysicalLayoutTest`: exported size = N × 4124),
+   validated imports on both planes (`SingleDbValidatedImport*`,
+   `DbsValidatedImportRejectedTest`), import over an open database
+   (`SingleDbImportOverOpenDatabaseTest`), and a perf smoke
+   (`VfsEncryptedPerformanceSmokeTest`).
+
+## Known limitations
+
+### Rollback to an earlier snapshot (accepted)
+
+A local-file attacker (backup restore, forensic substitution, malware with
+filesystem access) can replace the OPFS directory with an earlier snapshot of
+the same pool. Every page decrypts correctly — same key, same AAD at each slot —
+and the user sees stale state: a revoked permission row still present, a deleted
+secret still there.
+
+The AAD binds no monotonic epoch because the web platform offers no
+tamper-evident storage to hold one. Mitigation needs external state the attacker
+cannot roll back with the file: a server-side version counter, a sync peer's
+latest epoch, or hardware. For a device on CryptoSync the practical mitigation is
+that a peer eventually delivers deltas that will not apply to the replayed local
+state — with an exploitable window until the next sync.
+
+### Same-origin in-page attacker (out of scope)
+
+An attacker running inside the origin (XSS, compromised dependency, malicious
+extension) does not need the key: they query through the existing worker bridge
+and receive plaintext rows. No file-level scheme can defend against this. See
+[`security/threat-model.md`](security/threat-model.md) for where it is handled
+instead.
+
+### Live-process memory dump (partial)
+
+While the worker holds a key, the 32 key bytes and the page being processed are
+in WASM linear memory. Defense in depth narrows the window but does not close it:
+
+- `plaintextScratch` is zero-filled after every page op, making the
+  recently-accessed-page exposure sub-microsecond rather than session-long.
+- Keys live only for the database's open lifetime and are wiped with
+  `clearBytes` on close.
+- The MessagePack buffers that carried keys from C# are zeroed once
+  `postMessage` returns.
+
+A full heap dump of the running worker still exposes mounted keys; the platform
+has no user-space enclave to hide them in.
+
+### WAL / `.db-shm` on disk (accepted)
+
+`journal_mode=WAL` puts `*.db-wal` and `*.db-shm` in OPFS beside the main
+database. Every byte of both — WAL frame headers and shared-memory page indices
+included — goes through the offset-remap envelope, so all of it is authenticated
+ciphertext. This is stricter than SQLCipher, which leaves 24-byte WAL frame
+headers in plaintext and with them the page numbers and commit markers. The cost
+is more files on disk than a `journal_mode=MEMORY` scheme would leave; the
+crash-safety trade is worth it.
+
+### In-place key rotation (not implemented)
+
+The slot-rekey primitive itself exists — `rekeySlots` re-wraps every logical page
+from one key to another (or to none) and runs on every boundary crossing:
+import, export, and the in-place `EnterEncrypted` / `LeaveEncrypted`
+conversions. What has no operation is rotating a *live* encrypted pool from its
+current key to a new one without that round trip. Rebinding a pool to a
+different passkey today means exporting an `.eds` and running the guided import.
+
+### Multi-tab concurrency (unchanged from vendor)
+
+Same constraint as vendor SAHPool: one writer per origin. The encryption layer
+adds no concurrency concerns of its own.
+
+## Defense-in-depth summary
+
+| Layer                                         | Status |
+|-----------------------------------------------|--------|
+| AEAD cipher (ChaCha20-Poly1305)               | ✓      |
+| Random per-write nonce                        | ✓      |
+| AAD binds dbPath + slotIndex                  | ✓      |
+| Envelope versioning (VfsKeyHeader)            | ✓      |
+| C# serialized-buffer zeroization              | ✓      |
+| Worker plaintext-scratch zeroization          | ✓      |
+| Worker global-key wipe on lock/leave/reset    | ✓      |
+| journal_mode=WAL with encrypted WAL frames    | ✓      |
+| Cross-library test vectors (BC ↔ awasm)       | ✓      |
+| Rollback protection                           | ✗ (out of scope, needs external state) |
+| Slot rekey (key→key, key→plain, plain→key)    | ✓      |
+| In-place rotation of a live pool's key        | ✗ (round-trip via `.eds` today) |
+| Same-origin script protection                 | ✗ (not possible at this layer) |
+
+## Code references
+
+- `src/Crypto/SqliteWasmBlazor.Crypto/TypeScript/worker/vfs-prf/sahpool-prf-vfs.ts` — forked SAHPool VFS with conditional ChaCha20-Poly1305.
+- `src/Crypto/SqliteWasmBlazor.Crypto/TypeScript/worker/vfs-prf/aad.ts` — AAD byte-layout builder.
+- `src/Crypto/SqliteWasmBlazor.Crypto/TypeScript/worker/vfs-prf/key-registry.ts` — worker-wide global key lifecycle.
+- `src/Base/SqliteWasmBlazor/TypeScript/worker/sqlite-worker.ts` — `setGlobalEncryptionKey`, `openDatabase`, import preflight, `unpackVfsKeyHeader`.
+- `src/Crypto/SqliteWasmBlazor.Crypto/Models/VfsKeyHeader.cs` — C# envelope with `Clear()` zeroization.
+- `src/Crypto/SqliteWasmBlazor.Crypto/Services/EncryptedSqliteWasmWorkerBridge.cs` — `SetEncryptionKeyAsync`, `VerifyEncryptedImportAsync`.
+- `src/Crypto/SqliteWasmBlazor.Crypto/Services/EncryptedSqliteWasmDatabaseService.cs` — pool lifecycle and whole-pool import/export.
+- `src/Base/SqliteWasmBlazor/TypeScript-Crypto/src/crypto-core/chacha20Poly1305.ts` — AEAD wrapper over `@awasm/noble`.

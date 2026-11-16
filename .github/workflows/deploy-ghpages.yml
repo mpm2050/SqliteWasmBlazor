@@ -1,58 +1,129 @@
 name: Deploy to GitHub Pages
 
 on:
-  workflow_dispatch:  # Manual trigger only
+  # publish.yml calls this after a release reaches nuget.org; the manual
+  # trigger re-deploys the Demo from whatever ref is picked, against the
+  # packages already published for its version.
+  workflow_call:
+  workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    # The same set the caller grants: a called workflow may narrow the
+    # token's permissions, never widen them.
     permissions:
-      contents: write
+      contents: read
       pages: write
       id-token: write
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     - name: Setup .NET
-      uses: actions/setup-dotnet@v4
+      uses: actions/setup-dotnet@v6
       with:
-        dotnet-version: '10.0.x'
+        global-json-file: global.json
 
     - name: Install wasm-tools workload
       run: dotnet workload install wasm-tools
 
     - name: Setup Node.js
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@v7
       with:
         node-version: '22'
 
-    - name: Install npm dependencies (Components)
+    - name: Setup Emscripten
+      if: ${{ !env.ACT }}
+      uses: mymindstorm/setup-emsdk@v15
+      with:
+        version: '3.1.56'
+
+    - name: Build native stub
+      if: ${{ !env.ACT }}
+      run: bash src/Base/SqliteWasmBlazor/native/build_stub.sh
+
+    - name: Install npm dependencies (TypeScript-Common)
       run: npm install
-      working-directory: SqliteWasmBlazor.Components/TypeScript
+      working-directory: src/Base/SqliteWasmBlazor/TypeScript-Common
+
+    - name: Install npm dependencies (TypeScript-Crypto)
+      run: npm install
+      working-directory: src/Base/SqliteWasmBlazor/TypeScript-Crypto
+
+    - name: Install npm dependencies (SqliteWasmBlazor worker)
+      run: npm install
+      working-directory: src/Base/SqliteWasmBlazor/TypeScript
+
+    - name: Install npm dependencies (Crypto worker)
+      run: npm install
+      working-directory: src/Crypto/SqliteWasmBlazor.Crypto/TypeScript
 
     - name: Set rootFolder for GitHub Pages
       run: |
-        cat SqliteWasmBlazor.Demo/wwwroot/appsettings.json | python3 -c "
+        cat samples/SqliteWasmBlazor.Demo/wwwroot/appsettings.json | python3 -c "
         import sys, json
         d = json.load(sys.stdin)
         d['rootFolder'] = '/SqliteWasmBlazor/'
         json.dump(d, sys.stdout, indent=2)
-        " > /tmp/appsettings.json && mv /tmp/appsettings.json SqliteWasmBlazor.Demo/wwwroot/appsettings.json
+        " > /tmp/appsettings.json && mv /tmp/appsettings.json samples/SqliteWasmBlazor.Demo/wwwroot/appsettings.json
 
     - name: Clean previous builds
       run: |
         dotnet clean -c Release --nologo
-        rm -rf SqliteWasmBlazor.Demo/bin/Release SqliteWasmBlazor.Demo/obj/Release
+        rm -rf samples/SqliteWasmBlazor.Demo/bin/Release samples/SqliteWasmBlazor.Demo/obj/Release
 
+    # This deploy validates the LIVE published nupkgs end-to-end after
+    # publish.yml has shipped them to nuget.org. So we deliberately DO NOT
+    # prebuild the libraries locally here: the Demo's Release-only
+    # PackageReference chain (Demo -> Crypto.UI -> Crypto -> base) must
+    # resolve from nuget.org so we exercise exactly what a downstream
+    # consumer would. build.yml / publish.yml prebuild locally because
+    # they ARE the source of those packages; this job is a downstream
+    # consumer.
+    #
+    # A freshly pushed version takes minutes to appear in nuget.org's flat
+    # container — the version list restore reads, and later than the
+    # package page shows it — so the build waits for it. The version is
+    # the Demo's own reference: SqliteWasmBlazorVersion in
+    # Directory.Build.props, the value the release tag was cut from.
+    - name: Wait for the packages on nuget.org
+      run: |
+        version=$(sed -n 's:.*<SqliteWasmBlazorVersion>\(.*\)</SqliteWasmBlazorVersion>.*:\1:p' Directory.Build.props)
+        if [ -z "$version" ]; then
+          echo "::error::SqliteWasmBlazorVersion not found in Directory.Build.props"
+          exit 1
+        fi
+        # The flat container lists versions lowercased.
+        version=$(printf '%s' "$version" | tr '[:upper:]' '[:lower:]')
+        index="$RUNNER_TEMP/index.json"
+        for id in sqlitewasmblazor sqlitewasmblazor.crypto sqlitewasmblazor.crypto.ui; do
+          for attempt in $(seq 1 60); do
+            # Fetched to a file, then searched: `curl | grep -q` would let
+            # grep close the pipe on a match and turn curl's SIGPIPE into a
+            # failed pipeline under pipefail.
+            if curl -fsSL -o "$index" "https://api.nuget.org/v3-flatcontainer/${id}/index.json" \
+                && grep -q "\"${version}\"" "$index"; then
+              echo "${id} ${version} is listed"
+              continue 2
+            fi
+            latest=$(grep -o '"[^"]*"' "$index" 2>/dev/null | tail -n 1 || true)
+            echo "${id} ${version} not listed yet (attempt ${attempt}/60; newest listed: ${latest:-none})"
+            sleep 30
+          done
+          echo "::error::${id} ${version} did not appear on nuget.org within 30 minutes"
+          exit 1
+        done
+
+    # Note: `dotnet build` on a single csproj does single-project restore
+    # which honors `<ItemGroup Condition="...">` blocks correctly — no
+    # solution-wide static-graph leak (the issue documented in build.yml).
     - name: Build Demo
-      run: dotnet build SqliteWasmBlazor.Demo/SqliteWasmBlazor.Demo.csproj -c Release --nologo
+      run: dotnet build samples/SqliteWasmBlazor.Demo/SqliteWasmBlazor.Demo.csproj -c Release --nologo
 
     - name: Publish Demo
-      run: dotnet publish SqliteWasmBlazor.Demo/SqliteWasmBlazor.Demo.csproj -c Release -o ./build --nologo /p:UseSharedCompilation=false
+      run: dotnet publish samples/SqliteWasmBlazor.Demo/SqliteWasmBlazor.Demo.csproj -c Release -o ./build --nologo /p:UseSharedCompilation=false
 
     - name: Add .nojekyll and 404.html
       run: |
@@ -61,10 +132,12 @@ jobs:
         cp index.html 404.html
 
     - name: Upload artifact
-      uses: actions/upload-pages-artifact@v3
+      uses: actions/upload-pages-artifact@v5
       with:
         path: ./build/wwwroot
+        # Dotfiles are dropped by default; keep the .nojekyll written above.
+        include-hidden-files: true
 
     - name: Deploy to GitHub Pages
       id: deployment
-      uses: actions/deploy-pages@v4
+      uses: actions/deploy-pages@v5

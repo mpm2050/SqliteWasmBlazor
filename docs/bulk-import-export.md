@@ -2,6 +2,12 @@
 
 Worker-side bulk operations for fast, memory-safe database import and export.
 
+**V2 bulk or a raw `.db`?** V2 moves *rows* — between schemas, as a seed, as a
+delta — and is what you want when the two sides are not the same database. To
+move the database itself, use the raw file paths in
+[Moving Databases In and Out](advanced-features.md#moving-databases-in-and-out);
+neither is memory-bound, so size is not the deciding factor.
+
 ## Architecture
 
 ```
@@ -35,11 +41,17 @@ Each file consists of a V2 header followed by serialized items:
 [Item N: MessagePack array]
 ```
 
+`MessagePackFileHeaderV2` (namespace `SqliteWasmBlazor`) is this header as a type:
+`MessagePackFileHeaderV2.Create<TDto>(tableName, primaryKeyColumn, recordCount)` derives the
+columns and the schema hash from the DTO — `SchemaHashGenerator.ComputeHash<TDto>()` is the
+same hash on its own — and `Validate(...)` checks a header read back. Serialize it with
+`MessagePackSerializer` ahead of the items.
+
 ## Multi-Part Export
 
 Large databases are automatically split into parts:
 
-1. Part size is estimated from a sample (configurable via `exportPartSizeMb` in `appsettings.json`)
+1. Part size is estimated from a sample against a configurable MB limit (the demo reads its own `exportPartSizeMb` from `appsettings.json`)
 2. Each part is a standard V2 file — independently valid and importable
 3. A `.msgpack-meta` JSON file lists all parts
 4. Import: pick the meta file, then select all part files
@@ -61,7 +73,7 @@ The worker converts between MessagePack wire format and SQLite types:
 
 | C# Type | MessagePack Wire | SQLite Type | Notes |
 |---------|-----------------|-------------|-------|
-| Guid | string (36-char) | TEXT or BLOB | Use `sqlTypeOverrides` for BLOB |
+| Guid | string (36-char) | TEXT (uppercase) | Never override — see below |
 | DateTime | Timestamp ext | TEXT (ISO 8601) | |
 | TimeSpan | int64 (Ticks) | TEXT | Worker formats as d.hh:mm:ss |
 | DateTimeOffset | [DateTime, short] | TEXT (ISO 8601) | |
@@ -74,18 +86,25 @@ The worker converts between MessagePack wire format and SQLite types:
 
 ### SQL Type Overrides
 
-EF Core's default SQLite type for `Guid` is TEXT. If your entity uses `[Column(TypeName = "BLOB")]`, pass an override:
+`sqlTypeOverrides` retypes a column whose storage form differs from its C# type
+default. **Never override a `Guid` column.** The ADO layer binds Guid parameters
+— and EF Core generates Guid literals — as uppercase TEXT, and SQLite's default
+BINARY collation makes `=` sensitive to both case and storage class. Import in
+any other form and the rows become unreachable by key, silently: they list and
+display correctly, because list queries carry no `Id` predicate and the reader
+decodes TEXT, BLOB and UTF-8 bytes alike, but `FindAsync` returns null and
+`UPDATE ... WHERE Id = @p` affects zero rows.
 
-```csharp
-var header = MessagePackFileHeaderV2.Create<TodoItemDto>(
-    tableName: "TodoItems",
-    primaryKeyColumn: "Id",
-    recordCount: count,
-    sqlTypeOverrides: new Dictionary<string, string> { ["Id"] = "BLOB" });
-```
+A `[Column(TypeName = "BLOB")]` annotation is not a reason to override either:
+SQLite's BLOB affinity is "none", so a TEXT value stays TEXT in a BLOB column.
+The worker writes uppercase TEXT for every `Guid` regardless of the declared
+column type.
+
+Whenever you add a row-writing path, cover it with a test that reads a row back
+**by key**, not just by listing it — see `BulkImport_RowsAreEfAddressable` in
+the TestApp.
 
 ## Known Limitations
 
 - `sqlite3_column_int64` has boundary errors in Emscripten WASM builds — export reads Int64 columns as SQLITE_TEXT and parses to BigInt
 - `long` values > `Number.MAX_SAFE_INTEGER` (2^53-1) are sent as text in EF Core parameters to avoid JSON precision loss
-- Raw .db export/import is limited by WASM memory — use V2 bulk for large databases

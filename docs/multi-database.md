@@ -61,15 +61,17 @@ builder.Services.AddDbContextFactory<NoteDbContext>(options =>
     options.UseSqliteWasm(connection);
 });
 
-builder.Services.AddSingleton<IDBInitializationService, DBInitializationService>();
 builder.Services.AddSqliteWasm();
 
 var host = builder.Build();
 
-// Initialize both databases with migration support
-await host.Services.InitializeSqliteWasmDatabaseAsync<TodoDbContext>();
-await host.Services.InitializeSqliteWasmDatabaseAsync<NoteDbContext>();
+// Declare both, in the order they should be migrated
+builder.Services.AddSqliteWasmDbContext<TodoDbContext>();
+builder.Services.AddSqliteWasmDbContext<NoteDbContext>();
 ```
+
+One `<SqliteWasmDatabaseInitializer/>` in the layout applies them all, in
+declaration order, stopping at the first failure.
 
 ### 3. Create Migrations for Each Context
 

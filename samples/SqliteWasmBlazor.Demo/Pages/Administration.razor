@@ -1,0 +1,177 @@
+@page "/administration"
+@using Microsoft.EntityFrameworkCore
+@using SqliteWasmBlazor.Models
+@inject IDbContextFactory<TodoDbContext> DbContextFactory
+@inject ISnackbar Snackbar
+@inject ISqliteWasmDatabaseService DatabaseService
+@inject IDialogService DialogService
+@inherits AdministrationModelComponent
+
+<PageTitle>Administration</PageTitle>
+
+@if (Model.GenerateTestData.Executing)
+{
+    <MudOverlay Visible="true" ZIndex="9999" DarkBackground="true" LockScroll="true" Absolute="false">
+        <MudPaper Class="pa-8" Elevation="8" Style="max-width: 400px;">
+            <MudStack Spacing="4" AlignItems="AlignItems.Center">
+                <MudText Typo="Typo.h6" Align="Align.Center">Generating Test Data</MudText>
+                <MudProgressLinear Color="Color.Primary"
+                                   Value="@Model.GenerateProgressPercent"
+                                   Size="Size.Large"
+                                   Rounded="true"
+                                   Class="mud-width-full" />
+                <MudText Typo="Typo.body2" Align="Align.Center" Color="Color.Secondary">
+                    @Model.GenerateProgress.ToString("N0") / @Model.EntryCount.ToString("N0") entries
+                </MudText>
+                <MudButton Variant="Variant.Outlined"
+                           Color="Color.Error"
+                           OnClick="@(() => Model.GenerateTestData.Cancel())"
+                           StartIcon="@Icons.Material.Filled.Cancel"
+                           Size="Size.Small">
+                    Cancel
+                </MudButton>
+            </MudStack>
+        </MudPaper>
+    </MudOverlay>
+}
+
+<MudContainer MaxWidth="MaxWidth.Large" Class="mt-4">
+    <MudText Typo="Typo.h3" GutterBottom="true">
+        <MudIcon Icon="@Icons.Material.Filled.AdminPanelSettings" Class="mr-2" />
+        Administration
+    </MudText>
+    <MudText Typo="Typo.body1" Color="Color.Secondary" Class="mb-6">
+        Database administration and performance testing tools
+    </MudText>
+
+    <DatabaseInformationAlert />
+
+    <AuthorizeView Policy="DatabaseOpen">
+        <NotAuthorized>
+            <AuthenticationPanel />
+        </NotAuthorized>
+        <Authorized>
+
+    <!-- Performance Testing Card -->
+    <MudPaper Elevation="2" Class="pa-4 mb-6">
+        <MudText Typo="Typo.h6" Class="mb-3">
+            <MudIcon Icon="@Icons.Material.Filled.Speed" Size="Size.Small" Class="mr-1" />
+            Performance Testing
+            <MudChip T="string" Size="Size.Small" Color="Color.Success" Variant="Variant.Text">FTS5 Enabled</MudChip>
+        </MudText>
+        <MudStack Spacing="3">
+            <MudGrid Spacing="2">
+                <MudItem xs="12" sm="6" md="3" Class="d-flex align-center">
+                    <MudSelect T="int"
+                               @bind-Value="Model.EntryCount"
+                               Label="Number of Entries"
+                               Variant="Variant.Outlined"
+                               Dense="true"
+                               FullWidth="true"
+                               Disabled="@Model.GenerateTestData.Executing">
+                        <MudSelectItem Value="10">10</MudSelectItem>
+                        <MudSelectItem Value="100">100</MudSelectItem>
+                        <MudSelectItem Value="1000">1,000</MudSelectItem>
+                        <MudSelectItem Value="10000">10,000</MudSelectItem>
+                        <MudSelectItem Value="100000">100,000</MudSelectItem>
+                        <MudSelectItem Value="1000000">1,000,000</MudSelectItem>
+                        <MudSelectItem Value="4000000">4,000,000</MudSelectItem>
+                    </MudSelect>
+                </MudItem>
+                <MudItem xs="12" sm="6" md="3" Class="d-flex align-center">
+                    <MudButtonAsyncRx Command="@Model.GenerateTestData"
+                                      Variant="Variant.Filled"
+                                      Color="Color.Secondary"
+                                      StartIcon="@Icons.Material.Filled.PlayArrow"
+                                      FullWidth="true">
+                        Generate
+                    </MudButtonAsyncRx>
+                </MudItem>
+                <MudItem xs="12" sm="6" md="3" Class="d-flex align-center">
+                    <MudButtonAsyncRx Command="@Model.Optimize"
+                                      Variant="Variant.Outlined"
+                                      Color="Color.Info"
+                                      StartIcon="@Icons.Material.Filled.Tune"
+                                      FullWidth="true"
+                                      Disabled="@Model.GenerateTestData.Executing">
+                        Optimize FTS5
+                    </MudButtonAsyncRx>
+                </MudItem>
+            </MudGrid>
+            <MudGrid Spacing="2">
+                <MudItem xs="12" sm="6" md="4" Class="d-flex align-center">
+                    <MudButtonAsyncRx Command="@Model.Rebuild"
+                                      Variant="Variant.Outlined"
+                                      Color="Color.Secondary"
+                                      StartIcon="@Icons.Material.Filled.Build"
+                                      FullWidth="true"
+                                      Disabled="@Model.GenerateTestData.Executing">
+                        Rebuild FTS5 Index
+                    </MudButtonAsyncRx>
+                </MudItem>
+                <MudItem xs="12" sm="6" md="4" Class="d-flex align-center">
+                    <MudButtonAsyncRx Command="@Model.CheckIntegrity"
+                                      Variant="Variant.Outlined"
+                                      Color="Color.Primary"
+                                      StartIcon="@Icons.Material.Filled.VerifiedUser"
+                                      FullWidth="true"
+                                      Disabled="@Model.GenerateTestData.Executing">
+                        Check FTS5 Integrity
+                    </MudButtonAsyncRx>
+                </MudItem>
+            </MudGrid>
+
+            @if (!string.IsNullOrEmpty(Model.PerformanceInfo))
+            {
+                <MudAlert Severity="Severity.Success" Variant="Variant.Outlined">
+                    @Model.PerformanceInfo
+                </MudAlert>
+            }
+        </MudStack>
+    </MudPaper>
+
+        </Authorized>
+    </AuthorizeView>
+
+    @* Full reset — the app's single wipe surface, and the reason it sits
+       outside the AuthorizeView above: an encrypted pool whose passkey is
+       gone can never satisfy the DatabaseOpen policy, so a reset behind that
+       gate is a reset the user in trouble can never reach. Its own card at
+       the bottom of the page keeps it clear of the maintenance buttons
+       above, which only touch todo rows while this drops every database in
+       the pool. Copy and label follow the encryption state — an encrypted
+       pool loses its key along with its data, and the button says so. *@
+    <MudPaper Elevation="0" Outlined="true" Class="pa-4 mt-8 mb-6">
+        <MudText Typo="Typo.h6" Color="Color.Error" Class="mb-1">
+            <MudIcon Icon="@Icons.Material.Filled.Warning" Size="Size.Small" Class="mr-1" />
+            @Model.Encryption.Localizer["Card_ResetTitle"]
+        </MudText>
+        <MudText Typo="Typo.body2" Color="Color.Secondary" Class="mb-3">
+            @Model.Encryption.ResetHint
+        </MudText>
+        <MudButtonAsyncRx Command="@Model.Encryption.Reset"
+                          ConfirmExecutionAsync="ConfirmResetAsync"
+                          Variant="Variant.Outlined"
+                          Color="Color.Error"
+                          StartIcon="@Icons.Material.Filled.RestartAlt">
+            @Model.Encryption.ResetLabel
+        </MudButtonAsyncRx>
+    </MudPaper>
+</MudContainer>
+
+@code {
+    /// <summary>
+    /// Confirmation gate for <c>EncryptionModel.Reset</c>. Wired into
+    /// <c>MudButtonAsyncRx.ConfirmExecutionAsync</c>: the command runs only
+    /// when this returns <c>true</c>. Wording follows the encryption state —
+    /// an encrypted pool warns about the unrecoverable content, a plain one
+    /// has nothing to warn about beyond the data loss itself.
+    /// </summary>
+    private Task<bool> ConfirmResetAsync()
+        => DialogService.ConfirmDestructiveAsync(
+            title: Model.Encryption.ResetLabel,
+            message: Model.Encryption.ResetConfirmation,
+            destructiveLabel: Model.Encryption.ResetLabel,
+            cancelLabel: Model.Encryption.Localizer["Btn_Cancel"]);
+
+}

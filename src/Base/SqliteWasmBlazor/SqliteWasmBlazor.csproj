@@ -1,0 +1,200 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- Package Metadata -->
+    <PackageId>SqliteWasmBlazor</PackageId>
+    <Version>$(SqliteWasmBlazorVersion)</Version>
+    <Authors>bernisoft</Authors>
+    <Company>bernisoft</Company>
+    <Product>SqliteWasmBlazor</Product>
+    <Description>The first filesystem-backed SQLite database with full EF Core support for Blazor WebAssembly. Uses OPFS (Origin Private File System) with synchronous access handles for true persistence. Complete ADO.NET provider with migrations, relationships, and all LINQ operators. Drop-in replacement for EF Core InMemory provider.</Description>
+    <PackageTags>blazor;wasm;sqlite;efcore;opfs;database;entityframework;webassembly;offline;persistence</PackageTags>
+    <Copyright>Copyright (c) 2025 bernisoft</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/b-straub/SqliteWasmBlazor</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/b-straub/SqliteWasmBlazor</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageReleaseNotes>
+      - Full EF Core ADO.NET provider
+      - OPFS SAHPool persistence
+      - MessagePack binary protocol
+      - Complete migration support
+      - Custom EF Core decimal functions
+      - Dual SQLite instance architecture
+    </PackageReleaseNotes>
+    <GeneratePackageOnBuild Condition="'$(Configuration)' == 'Release'">true</GeneratePackageOnBuild>
+    <IncludeSymbols>true</IncludeSymbols>
+    <EmbedAllSources>true</EmbedAllSources>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <PackageOutputPath>$(MSBuildThisFileDirectory)../../../.nuget</PackageOutputPath>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <NoWarn>$(NoWarn);NU5118</NoWarn>
+  
+    <!-- Every public member here is documented. CS1591 is suppressed
+         solution-wide in Directory.Build.props while Crypto and Crypto.UI
+         catch up; this project has caught up, so it opts back in and an
+         undocumented public member fails the build rather than sliding by.
+         See ToDo/PublicApiDocs.md. -->
+    <NoWarn>$(NoWarn.Replace('CS1591',''))</NoWarn>
+    <WarningsAsErrors>$(WarningsAsErrors);CS1591</WarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Plane 2 engine (post plane-split Phase 2b). Hosts the
+         EncryptedSqliteWasmWorkerBridge which wraps plane-1's bridge via
+         the internal binary-payload helpers (PostBinary* / MarkDatabaseClosed). -->
+    <InternalsVisibleTo Include="SqliteWasmBlazor.Crypto" />
+    <!-- Plane 3 engine still uses plane-1's bridge for non-encryption
+         primitives (SendRequestAsync etc. via internal helpers). Encryption
+         + delta calls now go through SqliteWasmBlazor.Crypto's bridge. -->
+    <InternalsVisibleTo Include="SqliteWasmBlazor.CryptoSync" />
+    <!-- TestApp tests directly call the bridge's internal primitives for
+         focused per-DB unit coverage. Encryption-related primitives now
+         live in SqliteWasmBlazor.Crypto; this entry stays for the plain-DB
+         coverage that doesn't go through the IEncryptedSqliteWasmDatabaseService loops. -->
+    <InternalsVisibleTo Include="SqliteWasmBlazor.TestApp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <SupportedPlatform Include="browser" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../../../README.md" Pack="true" PackagePath="/" />
+    <None Include="../../../LICENSE" Pack="true" PackagePath="/" />
+    <!-- buildTransitive/ instead of build/ so the .targets propagates to
+         transitive PackageReference consumers (e.g. an app that only
+         references SqliteWasmBlazor.Crypto.UI still gets the stub-injection
+         + SQLitePCLRaw native exclusion). NuGet auto-imports buildTransitive/
+         for direct consumers too, so build/SqliteWasmBlazor.targets is no
+         longer needed. -->
+    <None Include="buildTransitive/SqliteWasmBlazor.targets" Pack="true" PackagePath="buildTransitive" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Exclude TypeScript source workspaces from NuGet pack AND publish
+         output. The Razor SDK otherwise treats `TypeScript/package.json`
+         etc. as static web assets and conflicts at `dotnet publish` time
+         with another package's TypeScript/ tree (NETSDK1152: same relative
+         path). The TS-bundled outputs ship from bundles/ and are registered
+         as StaticWebAsset items by the BuildTypeScriptBundles target, never
+         as Content. -->
+    <Content Remove="TypeScript/**" />
+    <None Remove="TypeScript/**" />
+    <Content Remove="TypeScript-Crypto/**" />
+    <None Remove="TypeScript-Crypto/**" />
+    <Content Remove="TypeScript-Common/**" />
+    <None Remove="TypeScript-Common/**" />
+    <!-- bundles/ is the generated TS output dir. Keep it out of every
+         default item glob so eval-time Integrity capture never sees these
+         files (that race produced internally-inconsistent nupkgs with
+         stale Integrity vs packed bytes). The target re-adds them as
+         <StaticWebAsset> items after npm finishes writing. -->
+    <Content Remove="bundles/**" />
+    <None Remove="bundles/**" />
+  </ItemGroup>
+  
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Components" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" />
+    <PackageReference Include="MessagePack" />
+    <PackageReference Include="Microsoft.Extensions.Options" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" />
+    <PackageReference Include="R3" />
+    <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" ExcludeAssets="all" PrivateAssets="all">
+      <IncludeAssets>none</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+  
+  <!-- Custom SQLite minimal stub library (8KB, replaces packaged e_sqlite3.a) -->
+  <ItemGroup>
+    <!-- Link the stub in this project -->
+    <NativeFileReference Include="native/lib/e_sqlite3.a" />
+    <!-- Include in NuGet package - targets file handles the NativeFileReference for consumers -->
+    <None Include="native/lib/e_sqlite3.a" Pack="true" PackagePath="native/lib" />
+  </ItemGroup>
+
+  <!-- npm install for the crypto-core + worker-common workspace deps before
+       bundling. base/TypeScript/ consumes both via file: dependencies — esbuild
+       walks into their src/ directories during bundling and needs their
+       node_modules (@awasm/noble, msgpackr, @sqlite.org/sqlite-wasm) to resolve
+       nested imports. The TypeScript-Crypto BUNDLE output (crypto-bridge.js)
+       is Crypto's responsibility and lives in SqliteWasmBlazor.Crypto.csproj. -->
+  <Target Name="NpmInstallTsWorkspaces" BeforeTargets="BuildTypeScriptBundles">
+    <Exec WorkingDirectory="TypeScript-Crypto" Command="npm audit signatures" Condition="Exists('TypeScript-Crypto/package.json') And !Exists('TypeScript-Crypto/node_modules')" />
+    <Exec WorkingDirectory="TypeScript-Crypto" Command="npm ci --ignore-scripts" Condition="Exists('TypeScript-Crypto/package.json') And !Exists('TypeScript-Crypto/node_modules')" />
+    <Exec WorkingDirectory="TypeScript-Common" Command="npm audit signatures" Condition="Exists('TypeScript-Common/package.json') And !Exists('TypeScript-Common/node_modules')" />
+    <Exec WorkingDirectory="TypeScript-Common" Command="npm ci --ignore-scripts" Condition="Exists('TypeScript-Common/package.json') And !Exists('TypeScript-Common/node_modules')" />
+  </Target>
+
+  <!-- Compile worker + bridge bundles to bundles/ (NOT wwwroot/) so the SDK
+       auto-include `<Content Include="wwwroot/**" />` glob never freezes a
+       stale Integrity at item-evaluation time. Inputs/Outputs makes esbuild
+       a no-op on incremental builds; the touched .build.stamp is what the
+       up-to-date check watches.
+
+       Split deliberately: the *build* target may skip when sources are
+       unchanged, but the *register* target below MUST run every build so
+       <StaticWebAsset> items reach ResolveStaticWebAssetsInputs. Folding
+       both into one Inputs/Outputs-gated target was the bug — when the
+       target body skipped, items were never added and downstream
+       consumers (Demo publish, NuGet pack) saw an empty asset manifest. -->
+  <Target Name="BuildTypeScriptBundles"
+          Inputs="@(_TsSrc);TypeScript/package.json"
+          Outputs="$(MSBuildProjectDirectory)/bundles/.build.stamp"
+          Condition="Exists('TypeScript/package.json')">
+    <Exec WorkingDirectory="TypeScript" Command="npm run build" Condition="'$(Configuration)' != 'Release'" />
+    <Exec WorkingDirectory="TypeScript" Command="npm run build:release" Condition="'$(Configuration)' == 'Release'" />
+    <Touch Files="$(MSBuildProjectDirectory)/bundles/.build.stamp" AlwaysCreate="true" />
+  </Target>
+
+  <Target Name="RegisterTypeScriptBundles"
+          BeforeTargets="ResolveStaticWebAssetsInputs"
+          DependsOnTargets="BuildTypeScriptBundles"
+          Condition="Exists('TypeScript/package.json')">
+    <ItemGroup>
+      <_GeneratedBundle Include="bundles/*.js;bundles/*.wasm" />
+    </ItemGroup>
+    <DefineStaticWebAssets Condition="@(_GeneratedBundle) != ''"
+                           CandidateAssets="@(_GeneratedBundle->'$(MSBuildProjectDirectory)/%(Identity)')"
+                           SourceId="$(PackageId)"
+                           SourceType="Computed"
+                           BasePath="$(StaticWebAssetBasePath)"
+                           ContentRoot="$(MSBuildProjectDirectory)/bundles/"
+                           AssetKind="All"
+                           AssetMode="All"
+                           AssetRole="Primary"
+                           FingerprintCandidates="$(StaticWebAssetsFingerprintContent)">
+      <Output TaskParameter="Assets" ItemName="StaticWebAsset" />
+    </DefineStaticWebAssets>
+    <DefineStaticWebAssetEndpoints Condition="@(_GeneratedBundle) != ''"
+                                   CandidateAssets="@(StaticWebAsset)"
+                                   ExistingEndpoints="@(StaticWebAssetEndpoint)"
+                                   ContentTypeMappings="@(StaticWebAssetContentTypeMapping)">
+      <Output TaskParameter="Endpoints" ItemName="StaticWebAssetEndpoint" />
+    </DefineStaticWebAssetEndpoints>
+  </Target>
+
+  <ItemGroup>
+    <!-- patches/ belongs here: the vendor SAHPool is patched on the way in
+         (npm run build runs patch-package first), so its .patch file is a
+         source of the bundle exactly like a .ts file is. Left out, editing
+         the patch leaves the stamp current and the bundle keeps the previous
+         vendor code with nothing to say so. -->
+    <_TsSrc Include="TypeScript/**/*.ts;TypeScript/package.json;TypeScript/patches/**;TypeScript-Common/**/*.ts;TypeScript-Common/package.json;TypeScript-Crypto/**/*.ts;TypeScript-Crypto/package.json"
+            Exclude="TypeScript/node_modules/**;TypeScript-Common/node_modules/**;TypeScript-Crypto/node_modules/**" />
+  </ItemGroup>
+
+</Project>

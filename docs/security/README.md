@@ -1,0 +1,48 @@
+# Security Documentation
+
+This folder collects the security-relevant documentation for SqliteWasmBlazor.
+
+## Contents
+
+| File | Description |
+|---|---|
+| [threat-model.md](threat-model.md) | Attacker model, in-scope and out-of-scope threats, channel-by-channel defenses, cryptographic primitives summary, and known limitations. Scope: plain SQLite WASM engine + PRF-keyed encryption VFS. |
+| [`../formal/`](../formal/README.md) | Machine-checked Tamarin models for the encryption VFS — per-slot AEAD soundness, in-place lifecycle, and key-cache / manifest unlock lemmas. |
+| [`../crypto-vfs.md`](../crypto-vfs.md) | Implementation reference for the PRF-keyed encryption VFS: page-level ChaCha20-Poly1305, AAD layout, code-reference table. |
+
+## Assurance summary
+
+| Property | Layer | Evidence |
+|---|---|---|
+| At-rest confidentiality of SQLite pages | Encryption VFS | ChaCha20-Poly1305 per 4 096-byte slot; AAD binds `(versionTag, dbPath, slotIndex)`. Formal model: `docs/formal/vfs-tamarin/vfs.spthy`. |
+| Tamper detection on OPFS contents | Encryption VFS | AEAD authentication failure surfaces as a read error. Lemma `legacy_or_cross_version_ciphertext_rejected` in `vfs.spthy`. |
+| Cross-database page swap rejection | Encryption VFS | `dbPath` in AAD. Lemma `cross_db_swap_rejected`. |
+| Cross-slot page swap rejection | Encryption VFS | `slotIndex` in AAD. Lemma `cross_slot_swap_rejected`. |
+| Wrong-key unlock rejection | Encryption VFS lifecycle | Slot-0 AEAD probe + manifest MAC verification before unlock acceptance. Modeled in `vfs-cache-import-lifecycle.spthy`. |
+| Wipe-after-validate on destructive whole-pool import | Encryption VFS lifecycle | Entire source validated read-only before the pool wipe — `.eds`: every slot of every file AEAD-verified; `.dbs`: full structural walk. Mistargeted, tampered, or truncated sources rejected with the pool untouched. Lemmas `pool_wipe_requires_validated_source`, `rejected_import_preserves_disk_state`, `rejected_import_never_wipes` in `vfs-cache-import-lifecycle.spthy`. |
+| Bounded one-shot key rotation | Encryption VFS | Single current-to-next rotation per pool; legacy ciphertext rejected after rotation. Modeled in `vfs.spthy`. |
+| Memory hygiene for secret buffers | C# / TypeScript | `CryptographicOperations.ZeroMemory` on every C# secret-bearing buffer; `clearBytes` helper on every JS bridge boundary. |
+
+The plain (Plane 1) layer makes no application-layer confidentiality claim
+beyond what the host OS and user agent provide for OPFS files. The whole
+catalog above applies to the Plane-2 encryption VFS.
+
+## Verifying the formal models
+
+The three Tamarin theories under `docs/formal/vfs-tamarin/` are self-contained
+and verifiable with the public [Tamarin Prover](https://tamarin-prover.com/)
+toolchain — 74 lemmas across the three. `./docs/formal/verify.sh` proves them
+and `./docs/formal/mutation-check.sh` shows they still bite; see
+[formal/](../formal/README.md).
+
+## Reporting vulnerabilities
+
+Please report security issues through GitHub's private vulnerability
+reporting rather than as a public issue:
+
+→ <https://github.com/b-straub/SqliteWasmBlazor/security/advisories/new>
+
+The maintainer is notified privately; the report stays embargoed until
+a fix is published. If the link 404s the feature has not been enabled
+on the repository yet — open a regular issue asking for it to be turned
+on (without disclosing details).

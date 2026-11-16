@@ -1,0 +1,58 @@
+@inherits DatabaseInformationAlertModelComponent
+
+@* Progress, not a fault: a migration on a populated database takes seconds
+   and there is nothing else on screen to say why. Checked before Failure
+   because the two are independent — a busy state carries no failure. *@
+@if (Model.IsBusy)
+{
+    <MudAlert Severity="Severity.Info" Class="mb-6" Variant="Variant.Filled">
+        <MudText Typo="Typo.body1">@Model.BusyMessage</MudText>
+        <MudProgressLinear Indeterminate="true" Color="Color.Inherit" Class="mt-3" />
+    </MudAlert>
+}
+else if (Model.Failure is { } failure)
+{
+    @* EncryptedDatabaseLockedFailure is the standard "disk encrypted, sign in
+       to unlock" state — the AuthenticationPanel below is the primary
+       recovery path. Render an Info-level notice without a Reset button
+       (Reset is destructive: wipes the encrypted DBs, only appropriate as a
+       last rescue from the dedicated /database-encryption page). *@
+    @if (failure is EncryptedDatabaseLockedFailure)
+    {
+        <MudAlert Severity="Severity.Info" Class="mb-6" Variant="Variant.Filled">
+            <MudText Typo="Typo.body1">@failure.DefaultMessage</MudText>
+        </MudAlert>
+    }
+    else
+    {
+    <MudAlert Severity="Severity.Error" Class="mb-6" Variant="Variant.Filled">
+        <MudText Typo="Typo.h6" Class="mb-2">@Model.Localizer["Header_Title"]</MudText>
+
+        @switch (failure)
+        {
+            case TabLockedFailure or TimeoutFailure:
+                <MudText Typo="Typo.body1" Class="mb-3">@failure.DefaultMessage</MudText>
+                <MudButton Variant="Variant.Filled"
+                           Color="Color.Primary"
+                           OnClick="ReloadPage"
+                           StartIcon="@Icons.Material.Filled.Refresh">
+                    @Model.Localizer["Btn_Reload"]
+                </MudButton>
+                break;
+
+            default:
+                <MudText Typo="Typo.body1" Style="white-space: pre-line;" Class="mb-3">@failure.DefaultMessage</MudText>
+                @if (Model.CanReset)
+                {
+                    <MudButtonAsyncRx Command="@Model.RequestReset"
+                                      Variant="Variant.Filled"
+                                      Color="Color.Warning"
+                                      StartIcon="@Icons.Material.Filled.RestartAlt">
+                        @Model.Localizer["Btn_Reset"]
+                    </MudButtonAsyncRx>
+                }
+                break;
+        }
+    </MudAlert>
+    }
+}

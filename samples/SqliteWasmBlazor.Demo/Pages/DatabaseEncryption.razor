@@ -1,0 +1,381 @@
+@page "/database-encryption"
+@inherits EncryptionModelComponent
+
+<PageTitle>Database Encryption</PageTitle>
+
+<MudContainer MaxWidth="MaxWidth.Medium" Class="mt-4">
+    <MudText Typo="Typo.h5" GutterBottom="true">
+        <MudIcon Icon="@Icons.Material.Filled.EnhancedEncryption" Class="mr-1"/>
+        @Model.Localizer["Page_Title"]
+    </MudText>
+    <MudText Typo="Typo.body2" Color="Color.Secondary" Class="mb-4">
+        @Model.Localizer["Page_Subtitle"]
+    </MudText>
+
+    <DatabaseInformationAlert/>
+
+    @* VFS state card — shown in every combination so the user always knows
+       where the VFS stands, even before authenticating. *@
+    <MudPaper Elevation="2" Class="pa-4 mb-4">
+        @* Wrap="Wrap.Wrap": the state chip carries a full sentence, so on a
+           phone the row cannot hold title and chip side by side — without
+           wrapping the title collapses word by word and the chip still runs
+           past the card. Wrapped, the chip drops to its own line and both
+           keep their natural width. *@
+        <MudStack Row="true" Wrap="Wrap.Wrap" AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween"
+                  Class="mb-3">
+            <MudText Typo="Typo.h6">
+                <MudIcon Icon="@Icons.Material.Filled.Storage" Size="Size.Small" Class="mr-1"/>
+                @Model.Localizer["Card_DatabasesTitle"]
+            </MudText>
+            @if (Model.IsPlain)
+            {
+                <MudChip T="string" Color="Color.Warning" Icon="@Icons.Material.Filled.LockOpen"
+                         Variant="Variant.Filled">
+                    @Model.Localizer["Pill_Plain"]
+                </MudChip>
+            }
+            else if (Model.IsUnlocked)
+            {
+                <MudChip T="string" Color="Color.Success" Icon="@Icons.Material.Filled.LockOpen"
+                         Variant="Variant.Filled">
+                    @Model.Localizer["Pill_Unlocked"]
+                </MudChip>
+            }
+            else if (Model.IsLocked)
+            {
+                <MudChip T="string" Color="Color.Error" Icon="@Icons.Material.Filled.Lock" Variant="Variant.Filled">
+                    @Model.Localizer["Pill_Locked"]
+                </MudChip>
+            }
+        </MudStack>
+
+        @if (Model.State?.Hint is { Length: > 0 } hint)
+        {
+            <MudText Typo="Typo.body2" Color="Color.Secondary" Class="mb-2">
+                @Model.Localizer["State_Hint", hint]
+            </MudText>
+        }
+
+        @* Public key — visible whenever a passkey is registered/active so
+           the user can copy it (e.g. to hand to a contact who will then
+           encrypt a disk export for them). Empty Auth.PublicKey simply
+           omits the block; the inner component handles non-empty rendering. *@
+        @if (!string.IsNullOrEmpty(Model.Auth.PublicKey))
+        {
+            <PublicKeyDisplay PublicKey="@Model.Auth.PublicKey" CredentialId="@Model.Auth.CredentialId"/>
+        }
+
+        @if (Model.IsPlain)
+        {
+            @* Plain: encrypting requires a passkey. Either point the user at
+               the auth panel below, or fire EnterEncrypted directly if they're
+               already signed in. *@
+            <AuthorizeView>
+                <Authorized>
+                    <MudStack Spacing="2" Class="mt-3">
+                        <MudButtonAsyncRx Command="@Model.EnterEncrypted"
+                                          Variant="Variant.Filled"
+                                          Color="Color.Primary"
+                                          StartIcon="@Icons.Material.Filled.Lock"
+                                          FullWidth="true">
+                            @Model.Localizer["Btn_Encrypt"]
+                        </MudButtonAsyncRx>
+                        <MudButtonAsyncRx Command="@Model.SignOut"
+                                          Variant="Variant.Outlined"
+                                          Color="Color.Default"
+                                          StartIcon="@Icons.Material.Filled.Logout"
+                                          FullWidth="true">
+                            @Model.Localizer["Btn_SignOut"]
+                        </MudButtonAsyncRx>
+                    </MudStack>
+                </Authorized>
+                <NotAuthorized>
+                    <MudText Typo="Typo.body2" Color="Color.Secondary">
+                        @Model.Localizer["Hint_AuthForEncrypt"]
+                    </MudText>
+                </NotAuthorized>
+            </AuthorizeView>
+        }
+        else if (Model.IsUnlocked)
+        {
+            <MudStack Spacing="2" Class="mt-3">
+                <MudButtonAsyncRx Command="@Model.LeaveEncrypted"
+                                  Variant="Variant.Filled"
+                                  Color="Color.Warning"
+                                  StartIcon="@Icons.Material.Filled.LockOpen"
+                                  FullWidth="true">
+                    @Model.Localizer["Btn_Leave"]
+                </MudButtonAsyncRx>
+                <MudButtonAsyncRx Command="@Model.Lock"
+                                  Variant="Variant.Outlined"
+                                  Color="Color.Default"
+                                  StartIcon="@Icons.Material.Filled.Lock"
+                                  FullWidth="true">
+                    @Model.Localizer["Btn_Lock"]
+                </MudButtonAsyncRx>
+            </MudStack>
+        }
+        else if (Model.IsLocked)
+        {
+            @* Encrypted-but-locked is normally transient — the lifecycle
+               service auto-unlocks the moment the user authenticates below,
+               so the auth panel is the visual focus here. A passkey that is
+               gone for good is recovered from the Administration page's full
+               reset, the one wipe surface in the app. *@
+            <MudText Typo="Typo.body2" Color="Color.Secondary" Class="mb-2">
+                @Model.Localizer["Hint_AuthForUnlock"]
+            </MudText>
+        }
+    </MudPaper>
+
+    @* Auth panel — rendered whenever the VFS isn't Encrypted+Unlocked.
+       Covers initial render (State still null before OnContextReadyAsync's
+       Refresh completes), Plain (sign-in needed to encrypt), and
+       Encrypted+Locked (sign-in needed to unlock). When the user is
+       already authorized the AuthorizeView's NotAuthorized branch is a
+       no-op, so nothing visible appears. *@
+    @if (!Model.IsUnlocked)
+    {
+        <AuthorizeView>
+            <NotAuthorized>
+                <AuthenticationPanel/>
+            </NotAuthorized>
+        </AuthorizeView>
+    }
+
+    @* Per-database card. One row per database, and every row owns the three
+       things that can happen to exactly that database: pick it for export,
+       replace it from a .db file, empty it. Whole-pool operations live in
+       their own cards below, so no action here can surprise the user with a
+       scope wider than the row it sits on.
+
+       Locked hides this card entirely: without the global key the worker can
+       neither decrypt a row for export nor encrypt one on write. *@
+    @if ((Model.IsPlain || Model.IsUnlocked) && Model.Databases.Count > 0)
+    {
+        <MudPaper Elevation="2" Class="pa-4 mb-4">
+            <MudText Typo="Typo.h6" Class="mb-1">
+                <MudIcon Icon="@Icons.Material.Filled.TableRows" Size="Size.Small" Class="mr-1"/>
+                @Model.Localizer["Card_DatabaseListTitle"]
+            </MudText>
+            <MudText Typo="Typo.caption" Color="Color.Secondary" Class="mb-3 d-block">
+                @Model.Localizer["Hint_DatabaseRows"]
+            </MudText>
+
+            <MudStack Spacing="0" Class="mb-3">
+                @foreach (var entry in Model.Databases)
+                {
+                    var row = entry;
+                    <MudStack Row="true" Wrap="Wrap.Wrap" AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween">
+                        <MudStack Row="true" AlignItems="AlignItems.Center" Spacing="1">
+                            @* An absent database can't be exported — but it can
+                               be imported into, which is why the row is here. *@
+                            @* Default size, matching the action buttons on
+                               the far side of the row; Dense trims the box's
+                               padding so the row keeps its height. *@
+                            <MudCheckBox T="bool"
+                                         Value="@Model.SelectedDatabases.Contains(row.Name)"
+                                         ValueChanged="@(checkedNow => OnDatabaseSelectionChanged(row.Name, checkedNow))"
+                                         Disabled="@(!row.Present)"
+                                         Label="@row.Name"
+                                         Dense="true"/>
+                            @if (!row.Present)
+                            {
+                                <MudChip T="string" Size="Size.Small" Variant="Variant.Text" Color="Color.Warning">
+                                    @Model.Localizer["Pill_NotCreated"]
+                                </MudChip>
+                            }
+                            else if (!row.Owned)
+                            {
+                                <MudChip T="string" Size="Size.Small" Variant="Variant.Text" Color="Color.Default">
+                                    @Model.Localizer["Pill_Unused"]
+                                </MudChip>
+                            }
+                        </MudStack>
+                        @* The three actions carry no labels, so they are the
+                           row's only tap targets on a phone: default size,
+                           not Small. *@
+                        <MudStack Row="true" AlignItems="AlignItems.Center" Spacing="0">
+                            @* Save this one database as a plain .db file —
+                               the shape a SQLite tool opens directly. The
+                               tick box next to the name is for the bundle
+                               below, not for this button. *@
+                            <MudIconButtonAsyncRxOf T="string"
+                                                    Command="@Model.ExportDatabase"
+                                                    Parameter="@row.Name"
+                                                    ConfirmExecutionAsync="@(() => ConfirmPlainExportAsync(row.Name))"
+                                                    Icon="@Icons.Material.Filled.SaveAlt"
+                                                    Color="Color.Default"
+                                                    Disabled="@(!row.Present)"
+                                                    title="@Model.Localizer["Btn_ExportDatabase", row.Name]"/>
+                            @* Per-row import: the file lands in this database,
+                               so there is no name to type and no way to create
+                               a stray the app will never open.
+
+                               MudFileUpload is an input control, and its root
+                               stacks whatever it holds in a column — left
+                               alone it lifts the button off the row's centre
+                               line. The flex utilities put it back on it. *@
+                            <MudFileUpload T="IBrowserFile"
+                                           Class="flex-row align-center"
+                                           Accept=".db,application/octet-stream"
+                                           FilesChanged="@(file => HandleRowFilePickedAsync(row, file))">
+                                <CustomContent>
+                                    @* Not an AsyncRx button — the command runs
+                                       from the picker's callback, not a press —
+                                       so the executing look is spelled out here.
+                                       Same icon and colour the Rx buttons on
+                                       this row switch to, so a row that is busy
+                                       reads the same whichever button started
+                                       it. *@
+                                    <MudIconButton Icon="@(Model.ImportDatabase.Executing
+                                                             ? Icons.Material.Filled.Refresh
+                                                             : Icons.Material.Filled.FileUpload)"
+                                                   Color="@(Model.ImportDatabase.Executing ? Color.Warning : Color.Default)"
+                                                   Disabled="@(!Model.ImportDatabase.CanExecute || Model.ImportDatabase.Executing)"
+                                                   title="@Model.Localizer["Btn_ImportIntoDatabase", row.Name]"
+                                                   OnClick="@context.OpenFilePickerAsync"/>
+                                </CustomContent>
+                                @* The picked file is spent the moment it is
+                                   picked — confirm, import, done. The default
+                                   chip list would push into the row naming a
+                                   file that is already dealt with, so the
+                                   template is present and empty. *@
+                                <SelectedTemplate Context="picked"></SelectedTemplate>
+                            </MudFileUpload>
+                            @* Owned rows are emptied, not removed — the app
+                               opens them by connection string, so they come
+                               back empty. A broom says that; a trash can says
+                               the row disappears, which only happens for an
+                               entry nothing reads. *@
+                            <MudIconButtonAsyncRxOf T="string"
+                                                    Command="@Model.DeleteDatabase"
+                                                    Parameter="@row.Name"
+                                                    ConfirmExecutionAsync="@(() => ConfirmClearDatabaseAsync(row))"
+                                                    Icon="@(row.Owned ? Icons.Material.Filled.CleaningServices : Icons.Material.Filled.Delete)"
+                                                    Color="Color.Error"
+                                                    Disabled="@(!row.Present)"
+                                                    title="@(row.Owned ? Model.Localizer["Btn_ClearDatabase"] : Model.Localizer["Btn_DeleteDatabase"])"/>
+                        </MudStack>
+                    </MudStack>
+                }
+            </MudStack>
+
+            @* Sits above the export affordances on purpose: installed on a
+               Home Screen, a finished export arrives on a full-screen OS
+               intermediate screen rather than as a saved file, and that
+               screen covers anything we could say afterwards. The wording
+               carries its own condition, so no platform sniffing is needed
+               to decide whether to show it. *@
+            <MudText Typo="Typo.caption" Color="Color.Secondary" Class="mb-2 d-block">
+                @Model.Localizer["Hint_ExportShapes"]
+                @Model.Localizer["Hint_ExportIntermediateScreen"]
+            </MudText>
+            @* The bundle only exists above one database: a single tick is
+               better served by that row's own save button, which produces a
+               file SQLite opens without unpacking. *@
+            @if (Model.SelectedDatabases.Count >= 2)
+            {
+                <MudButtonAsyncRx Command="@Model.ExportDatabases"
+                                  ConfirmExecutionAsync="ConfirmPlainBundleExportAsync"
+                                  Variant="Variant.Outlined"
+                                  Color="Color.Default"
+                                  StartIcon="@Icons.Material.Filled.Inventory2"
+                                  FullWidth="true">
+                    @Model.Localizer["Btn_ExportBundle", Model.SelectedDatabases.Count]
+                </MudButtonAsyncRx>
+            }
+        </MudPaper>
+    }
+
+    @* Backup & share card — Encrypted+Unlocked only: both flavours rekey
+       every page, which needs the installed global key. *@
+    @if (Model.IsUnlocked)
+    {
+        <MudPaper Elevation="2" Class="pa-4 mb-4">
+            <MudText Typo="Typo.h6" Class="mb-1">
+                <MudIcon Icon="@Icons.Material.Filled.Backup" Size="Size.Small" Class="mr-1"/>
+                @Model.Localizer["Card_BackupTitle"]
+            </MudText>
+            <MudText Typo="Typo.caption" Color="Color.Secondary" Class="mb-3 d-block">
+                @Model.Localizer["Hint_BackupCard"]
+            </MudText>
+
+            <MudButtonAsyncRx Command="@Model.ExportPoolBackup"
+                              Variant="Variant.Outlined"
+                              Color="Color.Primary"
+                              StartIcon="@Icons.Material.Filled.FileDownload"
+                              FullWidth="true"
+                              Class="mb-4">
+                @Model.Localizer["Btn_ExportPoolBackup"]
+            </MudButtonAsyncRx>
+
+            <MudTextField T="string"
+                          Value="@Model.PastedRecipientKey"
+                          ValueChanged="@(v => Model.PastedRecipientKey = v ?? string.Empty)"
+                          Immediate="true"
+                          Label="@(Model.Localizer["Field_RecipientKey"])"
+                          Variant="Variant.Filled"
+                          Sizing="InputSizing.Auto"
+                          MaxLines="10"
+                          Margin="Margin.Dense"
+                          Typo="Typo.caption"/>
+            <MudText Typo="Typo.caption" Class="mud-text-secondary mb-2">
+                @Model.Localizer["Field_RecipientKey_Help"]
+            </MudText>
+            @if (Model.PastedRecipientError is { Length: > 0 } pastedErr)
+            {
+                <MudAlert Severity="Severity.Warning" Class="mb-2">@pastedErr</MudAlert>
+            }
+            <MudButtonAsyncRx Command="@Model.ExportPoolForRecipient"
+                              Variant="Variant.Outlined"
+                              Color="Color.Secondary"
+                              StartIcon="@Icons.Material.Filled.Share"
+                              FullWidth="true">
+                @Model.Localizer["Btn_ExportPoolForRecipient"]
+            </MudButtonAsyncRx>
+        </MudPaper>
+    }
+
+    @* Replace-everything card. Both formats here wipe the pool, which is why
+       they are the only things in it — the warning above the picker applies
+       to whatever the user picks. Available from every disk state: .eds
+       carries its own passkey binding and the command locks an open session
+       itself, while .dbs writes plain pages and therefore needs a key that
+       is either absent (Plain) or installed (Unlocked). *@
+    <MudPaper Elevation="2" Class="pa-4 mb-4">
+        <MudText Typo="Typo.h6" Class="mb-1">
+            <MudIcon Icon="@Icons.Material.Filled.SwapVert" Size="Size.Small" Class="mr-1"/>
+            @Model.Localizer["Card_ReplaceAllTitle"]
+        </MudText>
+        <MudAlert Severity="Severity.Warning" Dense="true" Class="mb-3">
+            @Model.Localizer["Hint_ReplaceAllWarning"]
+        </MudAlert>
+        <MudText Typo="Typo.caption" Color="Color.Secondary" Class="mb-2 d-block">
+            @(Model.IsLocked
+                ? Model.Localizer["Hint_ReplaceAllKinds_Locked"]
+                : Model.Localizer["Hint_ReplaceAllKinds"])
+        </MudText>
+        @* Both of these replace the whole pool and take as long as the file
+           is big. The picker's own button cannot show that — the import
+           starts from its callback — so the card carries the sign. *@
+        @if (Model.ImportPool.Executing || Model.ImportDatabases.Executing)
+        {
+            <MudProgressLinear Color="Color.Primary" Indeterminate="true" Class="mb-2"/>
+        }
+        <MudFileUpload T="IBrowserFile"
+                       Disabled="@(Model.ImportPool.Executing || Model.ImportDatabases.Executing)"
+                       Accept="@(Model.IsLocked ? ".eds,application/octet-stream" : ".eds,.dbs,application/octet-stream")"
+                       FilesChanged="@(file => HandleReplaceAllFilePickedAsync(file))">
+            @* Picking a file runs the whole import, so the default chip list
+               would linger under the button naming a file that has already
+               replaced the pool — or one the user waved away at the
+               confirmation. Present and empty, as on the rows above. *@
+            <SelectedTemplate Context="picked"></SelectedTemplate>
+        </MudFileUpload>
+        <MudText Typo="Typo.caption" Color="Color.Secondary" Class="mt-1 d-block">
+            @Model.Localizer["Hint_ImportFileSize"]
+        </MudText>
+    </MudPaper>
+</MudContainer>

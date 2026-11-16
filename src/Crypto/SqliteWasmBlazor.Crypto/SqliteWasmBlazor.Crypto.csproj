@@ -1,0 +1,155 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+
+  <!--
+    Plane 2 engine: PRF-keyed at-rest encryption. Hosts the encrypted-VFS
+    lifecycle service (IEncryptedSqliteWasmDatabaseService), PRF key
+    derivation (PrfService + SubtleCryptoProvider), the secure key cache,
+    signing service, and the EncryptedSqliteWasmWorkerBridge that wraps
+    plane-1's worker bridge for encrypted operations.
+
+    Plane 2 = SqliteWasmBlazor.Crypto (this assembly, engine) +
+              SqliteWasmBlazor.Crypto.UI (panels).
+    Carved out of SqliteWasmBlazor in plane-split Phase 2b.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <Version>$(SqliteWasmBlazorVersion)</Version>
+    <PackageId>SqliteWasmBlazor.Crypto</PackageId>
+    <Authors>bernisoft</Authors>
+    <Description>Plane 2 engine for SqliteWasmBlazor: PRF-keyed at-rest encryption on top of the plain SQLite engine. Encrypted VFS lifecycle, WebAuthn-PRF key derivation, secure key cache, signing service. Add SqliteWasmBlazor.Crypto.UI for default auth/lock/unlock panels.</Description>
+    <PackageTags>blazor;wasm;sqlite;encryption;webauthn;prf;vfs;at-rest</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/b-straub/SqliteWasmBlazor</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/b-straub/SqliteWasmBlazor</RepositoryUrl>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GeneratePackageOnBuild Condition="'$(Configuration)' == 'Release'">true</GeneratePackageOnBuild>
+    <IncludeSymbols>true</IncludeSymbols>
+    <EmbedAllSources>true</EmbedAllSources>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <PackageOutputPath>$(MSBuildThisFileDirectory)../../../.nuget</PackageOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="../../../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <SupportedPlatform Include="browser" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Plane 2 UI sub-assembly consumes plane 2 engine internals (the
+         EncryptedSqliteWasmWorkerBridge is internal; UI calls go through
+         IEncryptedSqliteWasmDatabaseService but the lifecycle helper
+         needs the bridge too). -->
+    <InternalsVisibleTo Include="SqliteWasmBlazor.Crypto.UI" />
+    <!-- Plane 3 engine reaches into Plane 2's worker bridge for delta
+         export/import/rotate primitives. Mirrors plane 1's existing
+         InternalsVisibleTo for CryptoSync. -->
+    <InternalsVisibleTo Include="SqliteWasmBlazor.CryptoSync" />
+    <!-- Test apps call internal bridge methods directly for focused per-DB
+         unit coverage (matches plane 1's pattern). -->
+    <InternalsVisibleTo Include="SqliteWasmBlazor.TestApp" />
+    <!-- xUnit layer-guard tests need to reference the internal
+         EncryptedSqliteWasmWorkerBridge type for reflection-based assertions. -->
+    <InternalsVisibleTo Include="SqliteWasmBlazor.CryptoSync.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="MessagePack" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Options" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" />
+    <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
+    <PackageReference Include="R3" />
+    <PackageReference Include="SqliteWasmBlazor" Condition="'$(Configuration)' == 'Release'" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(Configuration)' == 'Debug'">
+    <ProjectReference Include="..\..\Base\SqliteWasmBlazor\SqliteWasmBlazor.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Exclude TypeScript/ source from both NuGet pack AND publish output —
+         the bundle is registered as a StaticWebAsset item by the
+         BuildTypeScriptBundles target below. -->
+    <Content Remove="TypeScript/**" />
+    <None Remove="TypeScript/**" />
+    <!-- bundles/ is the generated TS output dir. Out of every default item
+         glob so eval-time Integrity capture never sees it (see base csproj
+         for the SRI-race rationale). -->
+    <Content Remove="bundles/**" />
+    <None Remove="bundles/**" />
+  </ItemGroup>
+
+  <!-- npm install for plane-2's TypeScript workspaces before bundling. Both
+       this project's own TypeScript/ and the shared crypto-core workspace
+       (base/TypeScript-Crypto/, which produces our crypto-bridge.js bundle). -->
+  <Target Name="NpmInstallTsWorkspaces" BeforeTargets="BuildTypeScriptBundles">
+    <Exec WorkingDirectory="TypeScript" Command="npm audit signatures" Condition="Exists('TypeScript/package.json') And !Exists('TypeScript/node_modules')" />
+    <Exec WorkingDirectory="TypeScript" Command="npm ci --ignore-scripts" Condition="Exists('TypeScript/package.json') And !Exists('TypeScript/node_modules')" />
+    <Exec WorkingDirectory="../../Base/SqliteWasmBlazor/TypeScript-Crypto" Command="npm audit signatures" Condition="Exists('../../Base/SqliteWasmBlazor/TypeScript-Crypto/package.json') And !Exists('../../Base/SqliteWasmBlazor/TypeScript-Crypto/node_modules')" />
+    <Exec WorkingDirectory="../../Base/SqliteWasmBlazor/TypeScript-Crypto" Command="npm ci --ignore-scripts" Condition="Exists('../../Base/SqliteWasmBlazor/TypeScript-Crypto/package.json') And !Exists('../../Base/SqliteWasmBlazor/TypeScript-Crypto/node_modules')" />
+  </Target>
+
+  <!-- Compile plane-2's worker + bridge + crypto-bridge bundles into bundles/
+       (NOT wwwroot/). crypto-bridge.js is produced by base/TypeScript-Crypto/
+       but its bundle is Crypto's asset — TypeScript-Crypto's npm scripts now
+       write directly into our bundles/. See base SqliteWasmBlazor.csproj for
+       the race rationale and the build/register target split. -->
+  <Target Name="BuildTypeScriptBundles"
+          Inputs="@(_TsSrc);TypeScript/package.json;@(_CryptoCoreSrc);../../Base/SqliteWasmBlazor/TypeScript-Crypto/package.json;@(_WorkerCommonSrc)"
+          Outputs="$(MSBuildProjectDirectory)/bundles/.build.stamp"
+          Condition="Exists('TypeScript/package.json')">
+    <Exec WorkingDirectory="../../Base/SqliteWasmBlazor/TypeScript-Crypto" Command="npm run build" Condition="'$(Configuration)' != 'Release' And Exists('../../Base/SqliteWasmBlazor/TypeScript-Crypto/package.json')" />
+    <Exec WorkingDirectory="../../Base/SqliteWasmBlazor/TypeScript-Crypto" Command="npm run build:release" Condition="'$(Configuration)' == 'Release' And Exists('../../Base/SqliteWasmBlazor/TypeScript-Crypto/package.json')" />
+    <Exec WorkingDirectory="TypeScript" Command="npm run build" Condition="'$(Configuration)' != 'Release'" />
+    <Exec WorkingDirectory="TypeScript" Command="npm run build:release" Condition="'$(Configuration)' == 'Release'" />
+    <Touch Files="$(MSBuildProjectDirectory)/bundles/.build.stamp" AlwaysCreate="true" />
+  </Target>
+
+  <Target Name="RegisterTypeScriptBundles"
+          BeforeTargets="ResolveStaticWebAssetsInputs"
+          DependsOnTargets="BuildTypeScriptBundles"
+          Condition="Exists('TypeScript/package.json')">
+    <ItemGroup>
+      <_GeneratedBundle Include="bundles/*.js;bundles/*.wasm" />
+    </ItemGroup>
+    <DefineStaticWebAssets Condition="@(_GeneratedBundle) != ''"
+                           CandidateAssets="@(_GeneratedBundle->'$(MSBuildProjectDirectory)/%(Identity)')"
+                           SourceId="$(PackageId)"
+                           SourceType="Computed"
+                           BasePath="$(StaticWebAssetBasePath)"
+                           ContentRoot="$(MSBuildProjectDirectory)/bundles/"
+                           AssetKind="All"
+                           AssetMode="All"
+                           AssetRole="Primary"
+                           FingerprintCandidates="$(StaticWebAssetsFingerprintContent)">
+      <Output TaskParameter="Assets" ItemName="StaticWebAsset" />
+    </DefineStaticWebAssets>
+    <DefineStaticWebAssetEndpoints Condition="@(_GeneratedBundle) != ''"
+                                   CandidateAssets="@(StaticWebAsset)"
+                                   ExistingEndpoints="@(StaticWebAssetEndpoint)"
+                                   ContentTypeMappings="@(StaticWebAssetContentTypeMapping)">
+      <Output TaskParameter="Endpoints" ItemName="StaticWebAssetEndpoint" />
+    </DefineStaticWebAssetEndpoints>
+  </Target>
+
+  <ItemGroup>
+    <_TsSrc Include="TypeScript/**/*.ts;TypeScript/package.json" Exclude="TypeScript/node_modules/**" />
+    <_CryptoCoreSrc Include="../../Base/SqliteWasmBlazor/TypeScript-Crypto/**/*.ts;../../Base/SqliteWasmBlazor/TypeScript-Crypto/package.json"
+                    Exclude="../../Base/SqliteWasmBlazor/TypeScript-Crypto/node_modules/**" />
+    <!-- @sqlitewasmblazor/worker-common is a file: dependency bundled into our
+         worker, so its sources are build inputs too — without them a change to
+         the shared MessagePack ↔ SQLite conversions leaves this bundle stale. -->
+    <_WorkerCommonSrc Include="../../Base/SqliteWasmBlazor/TypeScript-Common/**/*.ts;../../Base/SqliteWasmBlazor/TypeScript-Common/package.json"
+                      Exclude="../../Base/SqliteWasmBlazor/TypeScript-Common/node_modules/**" />
+  </ItemGroup>
+
+</Project>

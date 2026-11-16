@@ -1,0 +1,300 @@
+// Streaming import for the asymmetric encrypted-pool envelope (v3).
+//
+// Consumes a Blob holding the full MessagePack EncryptedPoolEnvelope via
+// blob.stream() — never materialises the whole envelope as a single buffer
+// in the worker. Two passes (run separately from C#):
+//
+//   1. Preflight: walk the file table, AEAD-decrypt EVERY slot of EVERY
+//      file under K_wrap with `prf-vfs-v1|{dbPath}|{slot}` AAD,
+//      discarding the plaintext. Slot-0 tag failure means WRONG_KEY;
+//      a later slot's failure means a tampered/corrupt envelope and
+//      throws. Either way: abort with no writes done.
+//   2. Commit:    re-stream the envelope, write each file as a temp slot
+//      via writeFileSlice chunk-by-chunk under globalKey, then promote
+//      all temps via atomicReplaceFile only after every file has been
+//      fully decrypted + rewritten.
+//
+// Why two passes: preflight preserves the wipe-after-validate invariant —
+// the caller wipes the existing pool only after preflight has
+// authenticated every byte of ciphertext in the envelope, so a crafted or
+// corrupt envelope can never destroy the existing pool. blob.stream() is
+// re-callable on the same Blob, so we re-open between passes — the bytes
+// never live concatenated in JS heap.
+//
+// The chunked single-database sink and the pool-shape contract it needs
+// are plane-neutral and live in worker-common; this module is the part
+// that is actually about keys.
+
+import {
+    encryptChaCha20Poly1305,
+    decryptChaCha20Poly1305,
+    clearBytes,
+} from '@sqlitewasmblazor/crypto-core';
+import {buildPageAad} from './aad.js';
+import {
+    POOL_IMPORT_TMP_SUFFIX,
+    BufferedStreamReader,
+    readArrayHeader,
+    readBinHeader,
+    readStr,
+    assertImportFileCount,
+    PoolImportResult,
+    type PoolImportResultCode,
+    type PoolUtilLike,
+    readUint,
+} from '@sqlitewasmblazor/worker-common';
+
+const SECTOR_SIZE = 4096;
+const PAGE_NONCE_LEN = 12;
+const PAGE_TAG_LEN = 16;
+const PHYSICAL_SLOT_SIZE = SECTOR_SIZE + PAGE_NONCE_LEN + PAGE_TAG_LEN; // 4124
+
+const ENVELOPE_VERSION = 3;
+const ENVELOPE_ARRAY_LEN = 8;
+const ENVELOPE_AAD_VERSION = 'v1';
+const PRF_SALT_LEN = 32;
+
+/**
+ * Forward-skip past the envelope's leading metadata block (everything
+ * before <c>Files</c>) on a fresh stream. After this call the reader is
+ * positioned exactly at the <c>Files</c> array header.
+ *
+ * The metadata is shape-validated (version + AadVersion + PrfSalt length)
+ * but otherwise discarded — the caller already supplies the unwrapped
+ * K_wrap and the recipient PRF + ECIES context lives in the recipient's
+ * own config, not the envelope.
+ */
+async function consumeEnvelopeMetadata(reader: BufferedStreamReader): Promise<void> {
+    const arrLen = await readArrayHeader(reader);
+    if (arrLen !== ENVELOPE_ARRAY_LEN) {
+        throw new Error(
+            `importPoolStreamed: expected envelope array(${ENVELOPE_ARRAY_LEN}), got array(${arrLen})`);
+    }
+    const version = await readUint(reader);
+    if (version !== ENVELOPE_VERSION) {
+        throw new Error(
+            `importPoolStreamed: unsupported envelope Version=${version} (expected ${ENVELOPE_VERSION})`);
+    }
+    const aadVersion = await readStr(reader);
+    if (aadVersion !== ENVELOPE_AAD_VERSION) {
+        throw new Error(
+            `importPoolStreamed: unsupported AadVersion='${aadVersion}' (expected '${ENVELOPE_AAD_VERSION}')`);
+    }
+    const prfSaltLen = await readBinHeader(reader);
+    if (prfSaltLen !== PRF_SALT_LEN) {
+        throw new Error(
+            `importPoolStreamed: PrfSalt must be ${PRF_SALT_LEN} bytes, got ${prfSaltLen}`);
+    }
+    await reader.skip(prfSaltLen);
+    // Discard remaining metadata strings: EphPub, WrapCt, WrapNonce,
+    // CredIdHint. Caller already supplies the unwrapped K_wrap; these
+    // strings are envelope-self-describing fields for future cross-app
+    // import paths.
+    await readStr(reader);
+    await readStr(reader);
+    await readStr(reader);
+    await readStr(reader);
+}
+
+/**
+ * Decrypt a physical slot under <paramref name="key"/> with AAD bound to
+ * <paramref name="aad"/>. Returns the freshly decrypted plaintext;
+ * caller wipes it.
+ */
+function decryptSlot(slot: Uint8Array, key: Uint8Array, aad: Uint8Array): Uint8Array {
+    const ct = slot.subarray(0, SECTOR_SIZE);
+    const nonce = slot.subarray(SECTOR_SIZE, SECTOR_SIZE + PAGE_NONCE_LEN);
+    const tag = slot.subarray(SECTOR_SIZE + PAGE_NONCE_LEN, PHYSICAL_SLOT_SIZE);
+    const cipherPlusTag = new Uint8Array(SECTOR_SIZE + PAGE_TAG_LEN);
+    cipherPlusTag.set(ct, 0);
+    cipherPlusTag.set(tag, SECTOR_SIZE);
+    return decryptChaCha20Poly1305({ciphertext: cipherPlusTag, nonce}, key, aad);
+}
+
+/**
+ * Write a freshly AEAD-sealed slot (`ct(4096) ‖ nonce(12) ‖ tag(16)`) at
+ * <paramref name="dstStart"/> within <paramref name="out"/>.
+ */
+function writeEncryptedSlot(
+    plaintext: Uint8Array,
+    key: Uint8Array,
+    aad: Uint8Array,
+    out: Uint8Array,
+    dstStart: number,
+): void {
+    const enc = encryptChaCha20Poly1305(plaintext, key, aad);
+    out.set(enc.ciphertext.subarray(0, SECTOR_SIZE), dstStart);
+    out.set(enc.nonce, dstStart + SECTOR_SIZE);
+    out.set(enc.ciphertext.subarray(SECTOR_SIZE), dstStart + SECTOR_SIZE + PAGE_NONCE_LEN);
+}
+
+/**
+ * Pass 1 — preflight. Walks the envelope's Files array and AEAD-verifies
+ * EVERY slot of EVERY file under K_wrap, discarding the plaintext.
+ * Returns OK only if the entire envelope authenticates; WRONG_KEY on a
+ * slot-0 tag failure (the key doesn't match); throws on a later slot's
+ * tag failure (slot 0 authenticated, so the key is right — the envelope
+ * itself is tampered or corrupt). No writes happen in this pass.
+ *
+ * Full coverage here is the security invariant, not an optimisation
+ * choice: the caller (C# service) wipes the existing pool between
+ * preflight and commit, so anything preflight does not authenticate
+ * could otherwise fail in commit AFTER the user's data is gone. A
+ * crafted envelope that authenticates slot 0 but corrupts slot k>0
+ * must be rejected here, while the existing disk is still intact.
+ */
+export async function importPoolStreamPreflight(
+    blob: Blob,
+    kWrap: Uint8Array,
+): Promise<PoolImportResultCode> {
+    const reader = new BufferedStreamReader(blob.stream().getReader());
+    try {
+        await consumeEnvelopeMetadata(reader);
+        const fileCount = await readArrayHeader(reader);
+        assertImportFileCount(fileCount, 'importPoolStreamed[preflight]');
+        for (let i = 0; i < fileCount; i++) {
+            const tupleLen = await readArrayHeader(reader);
+            if (tupleLen !== 2) {
+                throw new Error(
+                    `importPoolStreamed[preflight]: EncryptedPoolFile must be array(2), got array(${tupleLen})`);
+            }
+            const name = await readStr(reader);
+            const binLen = await readBinHeader(reader);
+            if (binLen === 0 || binLen % PHYSICAL_SLOT_SIZE !== 0) {
+                throw new Error(
+                    `importPoolStreamed[preflight]: file '${name}' length ${binLen} is not a positive multiple of slot size ${PHYSICAL_SLOT_SIZE}`);
+            }
+            const dbPath = `/databases/${name}`;
+            const totalSlots = binLen / PHYSICAL_SLOT_SIZE;
+            for (let slotIdx = 0; slotIdx < totalSlots; slotIdx++) {
+                const slot = await reader.read(PHYSICAL_SLOT_SIZE);
+                const aad = buildPageAad(dbPath, slotIdx);
+                try {
+                    const plaintext = decryptSlot(slot, kWrap, aad);
+                    clearBytes(plaintext);
+                } catch {
+                    // Only the very first slot of the envelope says anything
+                    // about the key. Once any slot has authenticated, the key
+                    // is right and a later failure means the envelope itself
+                    // is tampered or corrupt.
+                    if (i === 0 && slotIdx === 0) {
+                        return PoolImportResult.WRONG_KEY;
+                    }
+                    throw new Error(
+                        `importPoolStreamed[preflight]: file '${name}' slot ${slotIdx} failed AEAD ` +
+                        `authentication although earlier slots verified — envelope is tampered ` +
+                        `or corrupt; refusing import (existing disk untouched).`);
+                } finally {
+                    clearBytes(slot);
+                }
+            }
+        }
+        return PoolImportResult.OK;
+    } finally {
+        reader.releaseLock();
+    }
+}
+
+/**
+ * Pass 2 — commit. Re-streams the envelope and for each file decrypts
+ * every slot under K_wrap + re-encrypts under <paramref name="globalKey"/>,
+ * writing each rekeyed slot batch via `writeFileSlice` to a temp slot in
+ * the SAH pool. Temp → final promotion is deferred until EVERY file has
+ * been staged, so a mid-envelope failure unlinks the temps and modifies
+ * no final dbPath. JS heap peak per file is one chunk (~1 MB) regardless
+ * of DB size.
+ *
+ * Caller (C# service) must have already wiped the pool and registered
+ * <paramref name="globalKey"/> as the worker's globalKey before calling
+ * this — typically via WipePoolAsync + EnterEncryptedAsync.
+ */
+export async function importPoolStreamCommit(
+    blob: Blob,
+    kWrap: Uint8Array,
+    globalKey: Uint8Array,
+    poolUtil: PoolUtilLike,
+): Promise<void> {
+    // 256 physical slots ≈ 1 MB rekey buffer per chunk write to the temp
+    // SAH. Matches the constant in encryptDatabaseInPlace.
+    const COMMIT_CHUNK_SLOTS = 256;
+    const reader = new BufferedStreamReader(blob.stream().getReader());
+    const tempPaths: string[] = [];
+    // Deferred promotion list: temp → final renames happen only after
+    // every file in the envelope has been fully decrypted, rekeyed and
+    // written. A failure anywhere before that point unlinks the temps
+    // and leaves no final dbPath modified.
+    const pendingPromotions: Array<{ tempPath: string; dbPath: string; name: string }> = [];
+    try {
+        await consumeEnvelopeMetadata(reader);
+        const fileCount = await readArrayHeader(reader);
+        assertImportFileCount(fileCount, 'importPoolStreamed[commit]');
+        for (let i = 0; i < fileCount; i++) {
+            const tupleLen = await readArrayHeader(reader);
+            if (tupleLen !== 2) {
+                throw new Error(
+                    `importPoolStreamed[commit]: EncryptedPoolFile must be array(2), got array(${tupleLen})`);
+            }
+            const name = await readStr(reader);
+            const binLen = await readBinHeader(reader);
+            if (binLen === 0 || binLen % PHYSICAL_SLOT_SIZE !== 0) {
+                throw new Error(
+                    `importPoolStreamed[commit]: file '${name}' length ${binLen} is not a positive multiple of slot size ${PHYSICAL_SLOT_SIZE}`);
+            }
+            const dbPath = `/databases/${name}`;
+            const tempPath = `${dbPath}${POOL_IMPORT_TMP_SUFFIX}`;
+            if (poolUtil.getFileNames().includes(tempPath)) {
+                try {
+                    poolUtil.unlink(tempPath);
+                } catch { /* best-effort */
+                }
+            }
+            tempPaths.push(tempPath);
+            const totalSlots = binLen / PHYSICAL_SLOT_SIZE;
+            let chunkBuf: Uint8Array | null = null;
+            for (let slotBase = 0; slotBase < totalSlots; slotBase += COMMIT_CHUNK_SLOTS) {
+                const slotCount = Math.min(COMMIT_CHUNK_SLOTS, totalSlots - slotBase);
+                chunkBuf = new Uint8Array(slotCount * PHYSICAL_SLOT_SIZE);
+                try {
+                    for (let s = 0; s < slotCount; s++) {
+                        const slot = await reader.read(PHYSICAL_SLOT_SIZE);
+                        const slotIdx = slotBase + s;
+                        const aad = buildPageAad(dbPath, slotIdx);
+                        const plaintext = decryptSlot(slot, kWrap, aad);
+                        try {
+                            writeEncryptedSlot(plaintext, globalKey, aad, chunkBuf, s * PHYSICAL_SLOT_SIZE);
+                        } finally {
+                            clearBytes(plaintext);
+                            clearBytes(slot);
+                        }
+                    }
+                    poolUtil.writeFileSlice(tempPath, slotBase * PHYSICAL_SLOT_SIZE, chunkBuf);
+                } finally {
+                    clearBytes(chunkBuf);
+                    chunkBuf = null;
+                }
+            }
+            pendingPromotions.push({tempPath, dbPath, name});
+        }
+        // Every file decrypted, rekeyed and staged — promote them all.
+        // Doing this only after the full envelope has been processed means
+        // a mid-envelope failure (truncation, AEAD, write error) never
+        // leaves the pool with a partial mix of old and new DBs.
+        for (const {tempPath, dbPath, name} of pendingPromotions) {
+            poolUtil.atomicReplaceFile(tempPath, dbPath);
+        }
+    } catch (error) {
+        // Unlink any staged temp that wasn't promoted. Promotion runs as
+        // the last step, so a pre-promotion failure cleans up everything;
+        // a failure inside the promotion loop itself (rename error) keeps
+        // already-promoted dbPaths and unlinks the rest.
+        for (const tempPath of tempPaths) {
+            try {
+                poolUtil.unlink(tempPath);
+            } catch { /* best-effort */
+            }
+        }
+        throw error;
+    } finally {
+        reader.releaseLock();
+    }
+}

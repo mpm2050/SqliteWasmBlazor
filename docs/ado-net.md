@@ -1,11 +1,7 @@
 # ADO.NET Usage
 
-SqliteWasmBlazor provides a **complete ADO.NET provider** that can be used standalone, without Entity Framework Core. This is perfect for scenarios where you:
-
-- Want lightweight database access without the EF Core overhead
-- Have existing ADO.NET code you want to port to Blazor WASM
-- Prefer writing raw SQL queries for full control
-- Need to work with large databases (1GB+) efficiently
+SqliteWasmBlazor's ADO.NET provider is complete and usable standalone, without
+Entity Framework Core.
 
 ## Setup for Non-EF Core Usage
 
@@ -20,11 +16,15 @@ var builder = WebAssemblyHostBuilder.CreateDefault(args);
 builder.Services.AddSqliteWasm();
 
 var host = builder.Build();
-
-// Initialize the SqliteWasm worker bridge (no EF Core needed)
-await host.Services.InitializeSqliteWasmAsync();
-
 await host.RunAsync();
+```
+
+The worker starts after the first render, so place the initializer once in your
+layout — no EF Core needed, and with no context declared there is nothing to
+migrate:
+
+```razor
+<SqliteWasmDatabaseInitializer/>
 ```
 
 ## Using the ADO.NET Provider
@@ -162,8 +162,10 @@ All standard ADO.NET types are implemented:
    - All operations are async (required for worker communication)
 
 2. **Initialization required**
-   - Call `host.Services.InitializeSqliteWasmAsync()` once at startup
-   - This initializes the Web Worker and OPFS
+   - Place `<SqliteWasmDatabaseInitializer/>` once in your layout
+   - It starts the Web Worker and OPFS after the first render
+   - A page that may render before the layout should await
+     `ISqliteWasmInitializer.InitializeAsync()` first; the call is idempotent
 
 3. **Persistence is automatic**
    - All changes are immediately written to OPFS
@@ -176,19 +178,15 @@ All standard ADO.NET types are implemented:
 
 ## When to Use ADO.NET vs EF Core
 
-**Use ADO.NET when you:**
-- Need lightweight access without EF Core overhead
-- Have simple CRUD operations
-- Want full control over SQL queries
-- Are porting existing ADO.NET code
-- Working with very large datasets where query control is critical
+The usual trade, with one WASM-specific wrinkle: EF Core brings migrations,
+LINQ and change tracking at the cost of ~1 MB of assemblies you ship to every
+visitor. Going without it is a real saving here in a way it is not on a server.
 
-**Use EF Core when you:**
-- Want automatic migrations
-- Need LINQ query composition
-- Want change tracking and lazy loading
-- Have complex relationships between entities
-- Prefer code-first database design
+Reach for raw ADO.NET when you are porting existing ADO.NET code, when the
+queries are simple enough that a mapper earns nothing, or when you want to
+control exactly what SQL runs. Take EF Core when you want the schema managed
+for you — `AddSqliteWasmDbContext<T>()` plus `<SqliteWasmDatabaseInitializer/>`
+applies migrations, and hand-rolling that is where most of the work would go.
 
 ## Database Management via DI
 
@@ -213,10 +211,12 @@ For database management operations (check existence, delete, rename), inject `IS
         // Recreate...
     }
 
-    private async Task BackupDatabaseAsync()
+    private async Task BackupDatabaseAsync(Stream destination)
     {
-        // Rename for backup
-        await DatabaseService.RenameDatabaseAsync("MyApp.db", "MyApp.backup.db");
+        // Export, don't rename. A rename onto an occupied name leaves the
+        // occupant's slot claimed but unreachable, and it leaves you with one
+        // copy under two names rather than a backup.
+        await DatabaseService.ExportDatabaseToStreamAsync("MyApp.db", destination);
     }
 }
 ```
